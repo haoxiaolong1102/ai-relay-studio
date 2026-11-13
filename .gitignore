@@ -1,0 +1,8 @@
+state/
+backups/
+config/projects.json
+config/claude-hooks.json
+menubar/build/
+__pycache__/
+*.pyc
+.DS_Store

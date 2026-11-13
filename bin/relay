@@ -1,0 +1,286 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""relay：AI 接力主命令。
+  relay status [工程代号]          看现状（只读）
+  relay handoff [--project 代号] [--to codex|antigravity] [--from-chat]   交给 Codex 或 Antigravity，让它自己接着做
+  relay takeback [--project 代号]  交回 Claude（也是“收工”）
+  relay open --project 代号 --tool antigravity|codex   开工：你要亲自到那个工具里做（只拍快照、登记，不启动模型）
+  relay switch                     总开关（弹窗菜单）
+  relay repair                     以锁为准修好内置盘抄本
+  relay snapshot <代号> | restore <代号> [快照号] | manifest <代号>
+  relay protect <代号> | unprotect <代号>          素材只读 / 撤回
+  relay precheck-net [--force]     禁网预检（只在配置里关掉 Codex 上网时才需要；会真调一次 Codex）
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from relaylib import audit, common, flow, lock, manifest, snapshot, ui  # noqa: E402
+from relaylib.common import RelayError  # noqa: E402
+
+
+def _heal(cfg):
+    try:
+        diffs = lock.reconcile(cfg)
+        if diffs:
+            print("发现锁和内置盘抄本不一致，已按锁修好：%s" % "；".join(diffs))
+    except RelayError as e:
+        print("注意：%s" % e)
+
+
+def _pick(cfg, want_holder, verb):
+    names = {}
+    for code, proj in cfg["projects"].items():
+        try:
+            h = lock.holder(code)
+        except Exception:
+            h = "unknown"
+        if h == want_holder or (want_holder != "claude" and h != "claude"):
+            names["%s（%s）" % (proj.get("name") or code, code)] = code
+    if not names:
+        raise RelayError("现在没有可以%s的工程。" % verb)
+    ans = ui.choose("选一个要%s的工程：" % verb, sorted(names))
+    if ans is None:
+        raise RelayError("已取消。")
+    return names[ans]
+
+
+def status_text(cfg, only=None):
+    lines = ["接力总开关：%s" % ("开" if cfg.get("live_enabled") else "关（所有钩子不干活）")]
+    for code, proj in cfg["projects"].items():
+        if only and code != only:
+            continue
+        try:
+            lk = lock.read_lock(code)
+            h = "%s（自 %s）" % (lk["holder"], lk.get("since") or "一直")
+            if lk["holder"] != "claude":
+                h += "，第 %s 段" % lk.get("segment")
+        except Exception as e:
+            h = "状态不明（%s）" % e
+        run = lock.Busy.peek(code)
+        snaps = snapshot.list_snaps(cfg, code)
+        lines.append("· %s [%s]：持棒者 %s%s；快照 %d 份%s" % (
+            proj.get("name") or code, code, h, "；接力正在跑" if run is not None else "",
+            len(snaps), "（最近 %s）" % snaps[-1]["id"] if snaps else ""))
+    diffs = lock.compare(cfg)
+    lines.append("锁与内置盘抄本：%s" % ("一致" if not diffs else "不一致 → " + "；".join(diffs)))
+    use = snapshot.usage(cfg)
+    if use:
+        lines.append("快照占用：" + "，".join("%s %.1f MB" % (k, v / 1e6) for k, v in use.items()))
+    return "\n".join(lines)
+
+
+def cmd_status(a, cfg):
+    print(status_text(cfg, a.project))
+
+
+def cmd_handoff(a, cfg):
+    _heal(cfg)
+    code = a.project or _pick(cfg, "claude", "交给 %s" % common.HOLDER_NAMES[a.to])
+    r = flow.handoff(cfg, code, by="claude-chat" if a.from_chat else "user", from_chat=a.from_chat, to=a.to)
+    print(r["message"])
+
+
+def cmd_takeback(a, cfg):
+    _heal(cfg)
+    code = a.project or _pick(cfg, "codex", "交回 Claude")
+    print(flow.takeback(cfg, code)["message"])
+
+
+def cmd_open(a, cfg):
+    _heal(cfg)
+    code = a.project or _pick(cfg, "claude", "开工")
+    print(flow.open_session(cfg, code, a.tool)["message"])
+
+
+def cmd_repair(a, cfg):
+    diffs = lock.reconcile(cfg)
+    print("已修复：%s" % "；".join(diffs) if diffs else "锁和抄本本来就一致。")
+
+
+def set_live(cfg, on):
+    cfg["live_enabled"] = bool(on)
+    common.save_config(cfg)
+    try:
+        lock.write_holders(cfg)
+    except RelayError as e:
+        print("注意：%s" % e)
+    audit.log(None, "user", "总开关变化", "开" if on else "关")
+
+
+def cmd_switch(a, cfg):
+    _heal(cfg)
+    while True:
+        cfg = common.load_config()
+        on = bool(cfg.get("live_enabled"))
+        opts = ["查看状态", "关掉接力（所有钩子不再干活）" if on else "打开接力", "修复状态（锁与抄本不一致时用）",
+                "看最近 50 条日志", "撤回素材只读", "还原改过的设置文件（用备份）", "退出"]
+        ans = ui.choose("接力总开关（现在：%s）" % ("开" if on else "关"), opts)
+        if ans in (None, "退出"):
+            return
+        if ans == "查看状态":
+            ui.info(status_text(cfg))
+        elif ans.startswith("关掉接力"):
+            set_live(cfg, False)
+            ui.info("已关掉。所有接力钩子现在都是空操作，不拦也不记。要恢复再双击这里选“打开接力”。")
+        elif ans == "打开接力":
+            set_live(cfg, True)
+            ui.info("已打开。")
+        elif ans.startswith("修复状态"):
+            diffs = lock.reconcile(cfg)
+            ui.info("已按锁修好抄本：\n%s" % "\n".join(diffs) if diffs else "锁和抄本本来就一致，不用修。")
+        elif ans.startswith("看最近"):
+            out = common.STATE / "audit" / "_recent.txt"
+            text = ""
+            for code in [None] + list(cfg["projects"]):
+                rows = audit.tail(code, 50)
+                if rows:
+                    text += "== %s ==\n%s\n" % (code or "全局", "".join(rows))
+            common.atomic_write_text(out, text or "还没有日志。\n")
+            subprocess.run(["open", "-e", str(out)])
+        elif ans == "撤回素材只读":
+            code = _pick(cfg, "claude", "撤回素材只读")
+            ui.info("已撤回：%s" % ("、".join(snapshot.unprotect(cfg, code)) or "这个工程没有登记素材目录"))
+        elif ans.startswith("还原改过的设置文件"):
+            restore_backup_interactive()
+
+
+def backup_file(path, note=""):
+    """改任何已有文件前先调它：拷到 backups/<时间>/ 并在 MANIFEST.txt 记原路径和指纹。"""
+    import hashlib
+    import shutil
+    path = common.real(path)
+    d = common.ROOT / "backups" / common.stamp()
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / os.path.basename(path)
+    shutil.copy2(path, str(dest))
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    with open(d / "MANIFEST.txt", "a", encoding="utf-8") as f:
+        f.write("%s\t%s\t%s\t%s\n" % (path, sha, dest.name, note))
+    audit.log(None, "relay", "备份", "%s → %s" % (path, dest))
+    return str(dest)
+
+
+def restore_backup_interactive():
+    base = common.ROOT / "backups"
+    items = {}
+    if base.is_dir():
+        for ts in sorted(os.listdir(str(base)), reverse=True):
+            mf = base / ts / "MANIFEST.txt"
+            if mf.is_file():
+                for line in mf.read_text(encoding="utf-8").splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        items["%s  ←  %s 的备份" % (parts[0], ts)] = (parts[0], str(base / ts / parts[2]))
+    if not items:
+        ui.info("还没有任何备份可还原。")
+        return
+    ans = ui.choose("选一个要还原的文件（会用备份覆盖现在的文件）：", list(items)[:20])
+    if ans is None:
+        return
+    orig, bak = items[ans]
+    if ui.ask("确定用备份覆盖 %s 吗？现在的版本会先另存一份备份。" % orig, ["取消", "还原"], "取消") != "还原":
+        return
+    import shutil
+    if os.path.exists(orig):
+        backup_file(orig, "还原前自动备份")
+    shutil.copy2(bak, orig)
+    audit.log(None, "user", "撤回", "用备份还原 %s" % orig)
+    ui.info("已还原：%s" % orig)
+
+
+def cmd_snapshot(a, cfg):
+    print(json.dumps(snapshot.take(cfg, a.project, "手动"), ensure_ascii=False, indent=2))
+
+
+def cmd_restore(a, cfg):
+    r = snapshot.restore(cfg, a.project, a.snapshot)
+    print("快照 %s 已解到新文件夹（没有覆盖原工程）：\n  %s\n共 %d 个文件。\n现在的工程与这份快照相比：" % (
+        r["snapshot"]["id"], r["dest"], r["files"]))
+    for k, v in r["now_vs_snapshot"].items():
+        print("  %s %d 项%s" % (k, len(v), "：" + "、".join(v[:20]) if v else ""))
+
+
+def cmd_manifest(a, cfg):
+    proj = common.project(cfg, a.project)
+    man = manifest.take(proj["path"], light=a.light)
+    if a.save:
+        manifest.save(a.project, a.save, man)
+    if a.diff:
+        old = manifest.load(a.project, a.diff)
+        if not old:
+            raise RelayError("没有名为 %s 的旧清单" % a.diff)
+        print(manifest.summarize(manifest.diff(old, man, proj.get("raw_dirs", ()))))
+    else:
+        print("共 %d 个文件" % len(man["files"]))
+
+
+def cmd_protect(a, cfg):
+    print("已设只读：%s" % ("、".join(snapshot.protect(cfg, a.project)) or "无"))
+
+
+def cmd_unprotect(a, cfg):
+    print("已撤回只读：%s" % ("、".join(snapshot.unprotect(cfg, a.project)) or "无"))
+
+
+def cmd_precheck(a, cfg):
+    ok, why = flow.net_precheck(cfg, force=a.force)
+    print("禁网预检：%s（%s）" % ("通过" if ok else "没过", why))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="relay", description="AI 接力")
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("status"); p.add_argument("project", nargs="?"); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("handoff"); p.add_argument("--project"); p.add_argument("--from-chat", action="store_true"); p.add_argument("--to", default="codex", choices=["codex", "antigravity"]); p.set_defaults(fn=cmd_handoff)
+    p = sub.add_parser("takeback"); p.add_argument("--project"); p.set_defaults(fn=cmd_takeback)
+    p = sub.add_parser("open"); p.add_argument("--project"); p.add_argument("--tool", default="antigravity", choices=["antigravity", "codex"]); p.set_defaults(fn=cmd_open)
+    p = sub.add_parser("switch"); p.set_defaults(fn=cmd_switch)
+    p = sub.add_parser("repair"); p.set_defaults(fn=cmd_repair)
+    p = sub.add_parser("snapshot"); p.add_argument("project"); p.set_defaults(fn=cmd_snapshot)
+    p = sub.add_parser("restore"); p.add_argument("project"); p.add_argument("snapshot", nargs="?"); p.set_defaults(fn=cmd_restore)
+    p = sub.add_parser("manifest"); p.add_argument("project"); p.add_argument("--light", action="store_true")
+    p.add_argument("--save"); p.add_argument("--diff"); p.set_defaults(fn=cmd_manifest)
+    p = sub.add_parser("protect"); p.add_argument("project"); p.set_defaults(fn=cmd_protect)
+    p = sub.add_parser("unprotect"); p.add_argument("project"); p.set_defaults(fn=cmd_unprotect)
+    p = sub.add_parser("precheck-net"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_precheck)
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help()
+        return 0
+    try:
+        cfg = common.load_config()
+        return a.fn(a, cfg) or 0
+    except RelayError as e:
+        if a.cmd in ("handoff", "takeback", "switch", "open"):
+            ui.info(str(e))
+        else:
+            print("没做成：%s" % e)
+        return 1
+    except ui.NoAnswer as e:
+        print("自测答案不够：%s" % e)
+        return 3
+    except KeyboardInterrupt:
+        print("已中断。")
+        return 130
+    except Exception as e:  # 兜底：白话 + 记日志，不把一屏报错甩给用户
+        import traceback
+        audit.log(None, "relay", "程序出错", "%s: %s" % (type(e).__name__, e))
+        common.ensure_private_dir(common.STATE / "audit")
+        with open(common.STATE / "audit" / "_last-error.txt", "w", encoding="utf-8") as f:
+            f.write(traceback.format_exc())
+        msg = "接力程序自己出错了（%s），已停下，没有继续做任何事。详情记在 state/audit/_last-error.txt。" % type(e).__name__
+        if a.cmd in ("handoff", "takeback", "switch", "open"):
+            ui.info(msg)
+        else:
+            print(msg)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

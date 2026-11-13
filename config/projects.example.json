@@ -1,0 +1,38 @@
+{
+  "live_enabled": true,
+  "holders_copy": "~/.claude/relay-holders.json",
+  "snapshots_dir": "~/ai-relay-snapshots",
+  "codex": {
+    "bin": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "model": "REPLACE-WITH-A-CODEX-MODEL-YOUR-PLAN-OFFERS",
+    "effort": "medium",
+    "max_segments": 4,
+    "segment_timeout_min": 20,
+    "total_timeout_min": 90,
+    "network_access": false,
+    "sandbox": "workspace-write"
+  },
+  "antigravity": {
+    "bin": "~/.local/bin/agy",
+    "model": "REPLACE-WITH-AN-ANTIGRAVITY-MODEL-YOUR-PLAN-OFFERS",
+    "permissions": "edits",
+    "max_segments": 4,
+    "segment_timeout_min": 20,
+    "total_timeout_min": 90
+  },
+  "git": {
+    "isolated_commit": true,
+    "push": false,
+    "remote": "origin",
+    "max_file_mb": 50
+  },
+  "projects": {
+    "demo": {
+      "name": "My project",
+      "path": "/absolute/path/to/your/project",
+      "raw_dirs": ["raw"],
+      "test_cmd": ["/usr/bin/python3", "-m", "unittest", "-q"],
+      "readonly_mcp": []
+    }
+  }
+}

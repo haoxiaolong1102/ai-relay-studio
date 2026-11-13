@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.claude/relay-shim.sh guard", "timeout": 5, "onFailure": "block" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          { "type": "command", "command": "__HOME__/.claude/relay-shim.sh append", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "__HOME__/.claude/relay-shim.sh stop", "timeout": 20 } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "__HOME__/.claude/relay-shim.sh stopfail", "timeout": 20 } ] }
+    ]
+  }
+}
