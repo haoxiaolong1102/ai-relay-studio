@@ -4,7 +4,7 @@
   "snapshots_dir": "~/ai-relay-snapshots",
   "codex": {
     "bin": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
-    "model": "REPLACE-WITH-A-CODEX-MODEL-YOUR-PLAN-OFFERS",
+    "model": "gpt-6.1-sol",
     "effort": "medium",
     "max_segments": 4,
     "segment_timeout_min": 20,
@@ -14,11 +14,25 @@
   },
   "antigravity": {
     "bin": "~/.local/bin/agy",
-    "model": "REPLACE-WITH-AN-ANTIGRAVITY-MODEL-YOUR-PLAN-OFFERS",
+    "model": "gemini-4-argon-medium",
     "permissions": "edits",
     "max_segments": 4,
     "segment_timeout_min": 20,
     "total_timeout_min": 90
+  },
+  "doubao": {
+    "api_url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "api_key": "",
+    "model": "doubao-seed-1-6-250615",
+    "web_url": "https://www.doubao.com/chat/",
+    "app_path": "/Applications/豆包浏览器.app"
+  },
+  "deepseek": {
+    "api_url": "https://api.deepseek.com/chat/completions",
+    "api_key": "",
+    "model": "deepseek-chat",
+    "web_url": "https://chat.deepseek.com/",
+    "app_path": ""
   },
   "git": {
     "isolated_commit": true,

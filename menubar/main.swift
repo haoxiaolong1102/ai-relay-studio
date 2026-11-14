@@ -1,40 +1,78 @@
-// 接力菜单栏图标 / Relay menu-bar item。只负责显示菜单和调用现成的 bin/relay，不含任何交接逻辑。
-// 编译：menubar/build.sh    撤掉：菜单里“退出接力图标”，再删掉编出来的 Relay.app 即可。
+// AI 接力台 (Relay Studio) — 原生 macOS 桌面应用 (SwiftUI + AppKit)
+// 支持：Claude Code / Codex / Antigravity / 豆包工作台 / DeepSeek 五合一接力 + 微信任意金额打赏弹窗
 import Cocoa
+import SwiftUI
 
-// 接力文件夹的位置：环境变量 RELAY_ROOT > 编译时写进 Info.plist 的 RelayRoot（build.sh 写）
 let ROOT = ProcessInfo.processInfo.environment["RELAY_ROOT"]
-    ?? (Bundle.main.object(forInfoDictionaryKey: "RelayRoot") as? String) ?? ""
-// 菜单文字跟系统语言走：中文系统显示中文，其余显示英文。RELAY_LANG=zh|en 可强制。
-let ZH: Bool = {
-    if let f = ProcessInfo.processInfo.environment["RELAY_LANG"] { return f.hasPrefix("zh") }
-    return (Locale.preferredLanguages.first ?? "en").hasPrefix("zh")
-}()
-func L(_ zh: String, _ en: String) -> String { return ZH ? zh : en }
+    ?? (Bundle.main.object(forInfoDictionaryKey: "RelayRoot") as? String)
+    ?? "/Users/eason/.gemini/antigravity/scratch/ai-relay"
 let PY = "/usr/bin/python3"
 let RELAY = ROOT + "/bin/relay"
 let HELPER = ROOT + "/menubar/relay_state.py"
 
-struct Proj {
-    let code: String, name: String, holder: String, since: String, running: Bool
+// MARK: - 数据结构
+
+struct ProjectItem: Identifiable, Equatable {
+    var id: String { code }
+    let code: String
+    let name: String
+    let path: String
+    let holder: String
+    let since: String
+    let running: Bool
+    let snapshotsCount: Int
+    let latestSnapshot: String
+    var stateMd: String
+    let batonMd: String
 }
 
-struct State {
-    var diskOK = false
-    var error: String? = nil
-    var live = false
-    var projects: [Proj] = []
-    var diffs: [String] = []
+struct SettingsData: Equatable {
+    var codexModel: String = "gpt-6.1-sol"
+    var agyModel: String = "gemini-4-argon-medium"
+    var doubaoModel: String = "doubao-seed-1-6-250615"
+    var doubaoApiUrl: String = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    var doubaoApiKey: String = ""
+    var doubaoWebUrl: String = "https://www.doubao.com/chat/"
+    var deepseekModel: String = "deepseek-chat"
+    var deepseekApiUrl: String = "https://api.deepseek.com/chat/completions"
+    var deepseekApiKey: String = ""
+    var deepseekWebUrl: String = "https://chat.deepseek.com/"
 }
 
-func run(_ args: [String], timeout: TimeInterval = 15) -> (Int32, String) {
+func holderDisplayName(_ h: String) -> String {
+    switch h {
+    case "claude": return "Claude Code"
+    case "codex": return "Codex"
+    case "antigravity": return "Antigravity"
+    case "doubao": return "豆包工作台"
+    case "deepseek": return "DeepSeek"
+    default: return h
+    }
+}
+
+func holderColor(_ h: String) -> Color {
+    switch h {
+    case "claude": return Color(red: 0.85, green: 0.46, blue: 0.34)
+    case "codex": return Color(red: 0.16, green: 0.64, blue: 0.50)
+    case "antigravity": return Color(red: 0.26, green: 0.48, blue: 0.92)
+    case "doubao": return Color(red: 0.20, green: 0.68, blue: 0.95)
+    case "deepseek": return Color(red: 0.42, green: 0.36, blue: 0.92)
+    default: return .gray
+    }
+}
+
+func runProcess(_ args: [String], envExtra: [String: String] = [:], timeout: TimeInterval = 120) -> (Int32, String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: args[0])
     p.arguments = Array(args.dropFirst())
+    var env = ProcessInfo.processInfo.environment
+    env["RELAY_NO_POPUP"] = "1"
+    for (k, v) in envExtra { env[k] = v }
+    p.environment = env
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
-    do { try p.run() } catch { return (-1, "\(error.localizedDescription)") }
+    do { try p.run() } catch { return (-1, error.localizedDescription) }
     let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
     DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -43,289 +81,1024 @@ func run(_ args: [String], timeout: TimeInterval = 15) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
-func parseState(_ out: String) -> State {
-    var s = State()
-    s.diskOK = true
-    guard let line = out.split(separator: "\n").last,
-          let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
-        s.error = L("读不到接力状态。", "Cannot read relay state. ") + String(out.suffix(200))
-        return s
+// MARK: - 核心状态管理 Store
+
+final class RelayStore: ObservableObject {
+    @Published var liveEnabled: Bool = true
+    @Published var projects: [ProjectItem] = []
+    @Published var selectedCode: String? = nil
+    @Published var diffs: [String] = []
+    @Published var logs: [String] = []
+    @Published var consoleOutput: String = "欢迎使用 AI 接力台！支持 Claude Code、Codex、Antigravity、豆包工作台、DeepSeek 一键安全接力。\n"
+    @Published var isBusy: Bool = false
+    @Published var busyTitle: String = ""
+    @Published var bannerMessage: String? = nil
+    @Published var showDonateSheet: Bool = false
+    @Published var showSettingsSheet: Bool = false
+    @Published var settings: SettingsData = SettingsData()
+    @Published var editedStateMd: String = ""
+    @Published var stateDirty: Bool = false
+
+    var actionCount: Int = 0
+    var hasPromptedDonate: Bool = false
+    var onStateUpdated: (() -> Void)?
+
+    var selectedProject: ProjectItem? {
+        guard let code = selectedCode else { return projects.first }
+        return projects.first(where: { $0.code == code }) ?? projects.first
     }
-    if (obj["ok"] as? Bool) != true {
-        s.error = (obj["error"] as? String) ?? L("读不到接力状态。", "Cannot read relay state.")
-        return s
+
+    func refresh(syncEditor: Bool = false) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (_, out) = runProcess([PY, HELPER, "json"], timeout: 15)
+            DispatchQueue.main.async {
+                self.applyJson(out, syncEditor: syncEditor)
+            }
+        }
     }
-    s.live = (obj["live"] as? Bool) ?? false
-    s.diffs = (obj["diffs"] as? [String]) ?? []
-    for p in (obj["projects"] as? [[String: Any]]) ?? [] {
-        s.projects.append(Proj(code: p["code"] as? String ?? "?", name: p["name"] as? String ?? "?",
-                               holder: p["holder"] as? String ?? "unknown", since: p["since"] as? String ?? "",
-                               running: p["running"] as? Bool ?? false))
+
+    func applyJson(_ out: String, syncEditor: Bool = false) {
+        guard let line = out.split(separator: "\n").last,
+              let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              (obj["ok"] as? Bool) == true else {
+            return
+        }
+        self.liveEnabled = (obj["live"] as? Bool) ?? true
+        self.diffs = (obj["diffs"] as? [String]) ?? []
+        self.logs = (obj["logs"] as? [String]) ?? []
+
+        var parsed: [ProjectItem] = []
+        for p in (obj["projects"] as? [[String: Any]]) ?? [] {
+            parsed.append(ProjectItem(
+                code: p["code"] as? String ?? "?",
+                name: p["name"] as? String ?? "?",
+                path: p["path"] as? String ?? "",
+                holder: p["holder"] as? String ?? "claude",
+                since: p["since"] as? String ?? "",
+                running: p["running"] as? Bool ?? false,
+                snapshotsCount: p["snapshots_count"] as? Int ?? 0,
+                latestSnapshot: p["latest_snapshot"] as? String ?? "",
+                stateMd: p["state_md"] as? String ?? "",
+                batonMd: p["baton_md"] as? String ?? ""
+            ))
+        }
+        let oldSelected = self.selectedCode
+        self.projects = parsed
+        if self.selectedCode == nil || !parsed.contains(where: { $0.code == self.selectedCode }) {
+            self.selectedCode = parsed.first?.code
+        }
+        if syncEditor || self.selectedCode != oldSelected || !self.stateDirty {
+            if let cur = self.selectedProject {
+                self.editedStateMd = cur.stateMd
+                self.stateDirty = false
+            }
+        }
+        if let st = obj["settings"] as? [String: Any] {
+            var s = SettingsData()
+            s.codexModel = st["codex_model"] as? String ?? s.codexModel
+            s.agyModel = st["agy_model"] as? String ?? s.agyModel
+            s.doubaoModel = st["doubao_model"] as? String ?? s.doubaoModel
+            s.doubaoApiUrl = st["doubao_api_url"] as? String ?? s.doubaoApiUrl
+            s.doubaoApiKey = st["doubao_api_key"] as? String ?? ""
+            s.doubaoWebUrl = st["doubao_web_url"] as? String ?? s.doubaoWebUrl
+            s.deepseekModel = st["deepseek_model"] as? String ?? s.deepseekModel
+            s.deepseekApiUrl = st["deepseek_api_url"] as? String ?? s.deepseekApiUrl
+            s.deepseekApiKey = st["deepseek_api_key"] as? String ?? ""
+            s.deepseekWebUrl = st["deepseek_web_url"] as? String ?? s.deepseekWebUrl
+            self.settings = s
+        }
+        self.onStateUpdated?()
     }
-    return s
+
+    func selectProject(_ code: String) {
+        self.selectedCode = code
+        if let cur = projects.first(where: { $0.code == code }) {
+            self.editedStateMd = cur.stateMd
+            self.stateDirty = false
+        }
+    }
+
+    func appendLog(_ text: String) {
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        self.consoleOutput += "\n[\(stamp)] \(text.trimmingCharacters(in: .whitespacesAndNewlines))\n"
+    }
+
+    func maybeTriggerDonatePopup() {
+        actionCount += 1
+        if !hasPromptedDonate && actionCount >= 1 {
+            hasPromptedDonate = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                self.showDonateSheet = true
+            }
+        }
+    }
+
+    func toggleLive(_ on: Bool) {
+        DispatchQueue.global().async {
+            let (_, out) = runProcess([PY, HELPER, "live", on ? "on" : "off"])
+            DispatchQueue.main.async {
+                self.applyJson(out)
+                self.appendLog("接力总开关已切为：\(on ? "开启" : "关闭")")
+            }
+        }
+    }
+
+    func saveStateMd() {
+        guard let proj = selectedProject else { return }
+        let text = editedStateMd
+        DispatchQueue.global().async {
+            let (_, out) = runProcess([PY, HELPER, "save-state", proj.code, text])
+            DispatchQueue.main.async {
+                self.stateDirty = false
+                self.applyJson(out)
+                self.bannerMessage = "✅ 已保存「\(proj.name)」的下一步任务 (docs/STATE.md)"
+                self.appendLog("已保存 \(proj.name) 的 docs/STATE.md")
+            }
+        }
+    }
+
+    func copyPrompt(toolName: String = "AI 助手") {
+        guard let proj = selectedProject else { return }
+        if stateDirty { saveStateMd() }
+        DispatchQueue.global().async {
+            let (_, _) = runProcess([PY, HELPER, "copy-prompt", proj.code, toolName])
+            DispatchQueue.main.async {
+                self.bannerMessage = "📋 已将「\(proj.name)」的完整接力提示词复制到剪贴板，可直接 Cmd+V 粘贴！"
+                self.appendLog("已复制「\(proj.name)」面向 \(toolName) 的上下文提示词到系统剪贴板。")
+            }
+        }
+    }
+
+    func runRelayCommand(title: String, args: [String], triggerDonateAfter: Bool = false) {
+        guard !isBusy else { return }
+        if stateDirty { saveStateMd() }
+        isBusy = true
+        busyTitle = title
+        bannerMessage = "⏳ 正在执行：\(title)…"
+        appendLog("开始执行：\(title)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (rc, out) = runProcess([PY, RELAY] + args, timeout: 600)
+            DispatchQueue.main.async {
+                self.isBusy = false
+                self.busyTitle = ""
+                let clean = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.appendLog(clean.isEmpty ? "完成（退出码 \(rc)）" : clean)
+                if rc == 0 {
+                    self.bannerMessage = "✅ \(title) 完成！"
+                    if triggerDonateAfter {
+                        self.maybeTriggerDonatePopup()
+                    }
+                } else {
+                    self.bannerMessage = "⚠️ \(title) 未完成，请查看下方日志说明"
+                }
+                self.refresh(syncEditor: true)
+            }
+        }
+    }
+
+    func addProjectInteractive() {
+        let panel = NSOpenPanel()
+        panel.title = "选择要接入 AI 接力台的工程文件夹"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "一键接入"
+        if panel.runModal() == .OK, let url = panel.url {
+            let folderPath = url.path
+            let folderName = url.lastPathComponent
+            isBusy = true
+            busyTitle = "正在初始化工程 \(folderName)…"
+            DispatchQueue.global().async {
+                let (_, out) = runProcess([PY, HELPER, "add-project", folderName, folderPath])
+                DispatchQueue.main.async {
+                    self.isBusy = false
+                    self.busyTitle = ""
+                    self.applyJson(out, syncEditor: true)
+                    if let last = self.projects.last {
+                        self.selectProject(last.code)
+                    }
+                    self.bannerMessage = "✅ 已一键接入工程「\(folderName)」（已自动配置 .gitignore、STATE.md 与 Claude 钩子）"
+                    self.appendLog("成功导入工程：\(folderName) (\(folderPath))")
+                }
+            }
+        }
+    }
+
+    func removeProject(_ code: String) {
+        DispatchQueue.global().async {
+            let (_, out) = runProcess([PY, HELPER, "remove-project", code])
+            DispatchQueue.main.async {
+                self.applyJson(out, syncEditor: true)
+                self.bannerMessage = "已从列表移除工程 \(code)（原工程文件未做任何删除）"
+            }
+        }
+    }
+
+    func saveSettings() {
+        let dict: [String: String] = [
+            "codex_model": settings.codexModel,
+            "agy_model": settings.agyModel,
+            "doubao_model": settings.doubaoModel,
+            "doubao_api_url": settings.doubaoApiUrl,
+            "doubao_api_key": settings.doubaoApiKey,
+            "doubao_web_url": settings.doubaoWebUrl,
+            "deepseek_model": settings.deepseekModel,
+            "deepseek_api_url": settings.deepseekApiUrl,
+            "deepseek_api_key": settings.deepseekApiKey,
+            "deepseek_web_url": settings.deepseekWebUrl,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let jsonStr = String(data: data, encoding: .utf8) else { return }
+        DispatchQueue.global().async {
+            let (_, out) = runProcess([PY, HELPER, "save-settings", jsonStr])
+            DispatchQueue.main.async {
+                self.applyJson(out)
+                self.showSettingsSheet = false
+                self.bannerMessage = "✅ 模型与 API 设置已保存！"
+                self.appendLog("已更新模型与国内大模型 API 设置。")
+            }
+        }
+    }
 }
 
-func loadState() -> State {
-    guard FileManager.default.fileExists(atPath: RELAY) else { return State() }
-    return parseState(run([PY, HELPER, "json"]).1)
-}
+// MARK: - 打赏弹窗视图（使用用户上传的微信收款码）
 
-func holderName(_ h: String) -> String {
-    switch h {
-    case "claude": return "Claude"
-    case "codex": return "Codex"
-    case "antigravity": return "Antigravity"
-    case "unknown": return L("状态不明", "unknown")
-    default: return h
+struct DonateSheetView: View {
+    @EnvironmentObject var store: RelayStore
+
+    var qrImage: NSImage? {
+        if let url = Bundle.main.url(forResource: "donate_qr", withExtension: "png"),
+           let img = NSImage(contentsOf: url) {
+            return img
+        }
+        let fallbackPath = ROOT + "/menubar/donate_qr.png"
+        return NSImage(contentsOfFile: fallbackPath)
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack {
+                Label("觉得好用？打赏支持作者", systemImage: "heart.fill")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(Color(red: 0.09, green: 0.68, blue: 0.31))
+                Spacer()
+                Button(action: { store.showDonateSheet = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text("如果「AI 接力台」帮你在 Claude、Codex、Antigravity、豆包、DeepSeek 之间省下了时间、保护了代码安全，欢迎微信扫码任意金额打赏支持！")
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let img = qrImage {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 280, height: 340)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 4)
+            } else {
+                Text("未找到收款码图片")
+                    .frame(width: 240, height: 240)
+            }
+
+            Text("任意金额都是莫大的鼓励，感谢你的支持 ❤️")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 14) {
+                Button("下次一定") {
+                    store.showDonateSheet = false
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button(action: {
+                    store.showDonateSheet = false
+                    store.bannerMessage = "❤️ 非常感谢你的赞赏与支持！祝你写代码行云流水！"
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "hand.thumbsup.fill")
+                        Text("已赞赏，继续干活！")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(red: 0.09, green: 0.68, blue: 0.31))
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .padding(24)
+        .frame(width: 420)
     }
 }
 
-func busyLabel(_ p: Proj) -> String {
-    let why = p.running ? L("正在跑", "running")
-        : p.holder == "claude" ? L("总开关关着", "master switch off")
-        : L("已在 \(holderName(p.holder)) 手里", "held by \(holderName(p.holder))")
-    return L("\(p.name)（\(why)）", "\(p.name) (\(why))")
+// MARK: - 模型与 API 设置弹窗
+
+struct SettingsSheetView: View {
+    @EnvironmentObject var store: RelayStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Label("五家大模型与 API 设置", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 17, weight: .bold))
+                Spacer()
+                Button("关闭") { store.showSettingsSheet = false }
+            }
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    GroupBox(label: Label("豆包工作台 (Doubao / 火山方舟)", systemImage: "sparkles")) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("工作台网址：").frame(width: 95, alignment: .trailing)
+                                TextField("https://www.doubao.com/chat/", text: $store.settings.doubaoWebUrl)
+                            }
+                            HStack {
+                                Text("API 接入点/模型：").frame(width: 95, alignment: .trailing)
+                                TextField("doubao-seed-1-6-250615", text: $store.settings.doubaoModel)
+                            }
+                            HStack {
+                                Text("API Key（可选）：").frame(width: 95, alignment: .trailing)
+                                SecureField("不填可用“一键带上下文去豆包工作台”；填了可后台自动改文件", text: $store.settings.doubaoApiKey)
+                            }
+                        }
+                        .padding(8)
+                    }
+
+                    GroupBox(label: Label("DeepSeek (深度求索)", systemImage: "brain.head.profile")) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("工作台网址：").frame(width: 95, alignment: .trailing)
+                                TextField("https://chat.deepseek.com/", text: $store.settings.deepseekWebUrl)
+                            }
+                            HStack {
+                                Text("模型名称：").frame(width: 95, alignment: .trailing)
+                                TextField("deepseek-chat 或 deepseek-reasoner", text: $store.settings.deepseekModel)
+                            }
+                            HStack {
+                                Text("API Key（可选）：").frame(width: 95, alignment: .trailing)
+                                SecureField("不填可用“一键带上下文去 DeepSeek”；填了可后台自动改文件", text: $store.settings.deepseekApiKey)
+                            }
+                        }
+                        .padding(8)
+                    }
+
+                    GroupBox(label: Label("海外命令行工具 (Codex & Antigravity)", systemImage: "terminal")) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Codex 模型：").frame(width: 95, alignment: .trailing)
+                                TextField("gpt-6.1-sol", text: $store.settings.codexModel)
+                            }
+                            HStack {
+                                Text("Antigravity 模型：").frame(width: 95, alignment: .trailing)
+                                TextField("gemini-4-argon-medium", text: $store.settings.agyModel)
+                            }
+                        }
+                        .padding(8)
+                    }
+                }
+            }
+
+            HStack {
+                Text("提示：使用“一键带上下文去工作台”完全免费、无需填写任何 API Key。")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("取消") { store.showSettingsSheet = false }
+                Button("保存设置") { store.saveSettings() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 560, height: 470)
+    }
 }
 
-final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    var state = State()
+// MARK: - 主窗口视图
+
+struct ToolCardView: View {
+    let title: String
+    let subtitle: String
+    let badge: String
+    let color: Color
+    let isCurrentHolder: Bool
+    let canHandOff: Bool
+    let primaryLabel: String
+    let primaryAction: () -> Void
+    let secondaryLabel: String?
+    let secondaryAction: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Circle()
+                    .fill(color)
+                    .frame(width: 10, height: 10)
+                Text(title)
+                    .font(.system(size: 14, weight: .bold))
+                Spacer()
+                Text(isCurrentHolder ? "当前持棒" : badge)
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background((isCurrentHolder ? color : Color.secondary).opacity(0.16))
+                    .foregroundColor(isCurrentHolder ? color : .secondary)
+                    .clipShape(Capsule())
+            }
+
+            Text(subtitle)
+                .font(.system(size: 11.5))
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+                .frame(height: 30, alignment: .topLeading)
+
+            HStack(spacing: 8) {
+                Button(action: primaryAction) {
+                    Text(primaryLabel)
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(color)
+                .disabled(!canHandOff)
+
+                if let secLabel = secondaryLabel, let secAct = secondaryAction {
+                    Button(action: secAct) {
+                        Text(secLabel)
+                            .font(.system(size: 11.5))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!canHandOff)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(NSColor.controlBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(isCurrentHolder ? color : Color.gray.opacity(0.2), lineWidth: isCurrentHolder ? 2 : 1)
+                )
+        )
+    }
+}
+
+struct MainWindowView: View {
+    @EnvironmentObject var store: RelayStore
+
+    var body: some View {
+        NavigationSplitView {
+            // 左侧栏：工程列表 + 总开关 + 打赏入口
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("我的接力工程")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button(action: { store.addProjectInteractive() }) {
+                        Label("添加", systemImage: "plus.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("选择一个工程文件夹，自动初始化并加入接力列表")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+                List(selection: Binding(
+                    get: { store.selectedProject?.code },
+                    set: { if let c = $0 { store.selectProject(c) } }
+                )) {
+                    ForEach(store.projects) { p in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(holderColor(p.holder))
+                                .frame(width: 9, height: 9)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(p.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .lineLimit(1)
+                                Text("持棒：\(holderDisplayName(p.holder))\(p.running ? "（运行中）" : "")")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 3)
+                        .tag(p.code)
+                        .contextMenu {
+                            Button("在 Finder 中打开") {
+                                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: p.path)
+                            }
+                            Button("从列表中移除", role: .destructive) {
+                                store.removeProject(p.code)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: Binding(
+                        get: { store.liveEnabled },
+                        set: { store.toggleLive($0) }
+                    )) {
+                        Text("接力总开关（拦截保护）")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .toggleStyle(.switch)
+
+                    HStack(spacing: 8) {
+                        Button("修复锁状态") {
+                            store.runRelayCommand(title: "修复锁与抄本状态", args: ["repair"])
+                        }
+                        .font(.system(size: 11))
+
+                        Button("模型设置") {
+                            store.showSettingsSheet = true
+                        }
+                        .font(.system(size: 11))
+                    }
+
+                    Button(action: { store.showDonateSheet = true }) {
+                        HStack {
+                            Image(systemName: "heart.fill")
+                                .foregroundColor(.white)
+                            Text("觉得好用？任意金额打赏")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.white)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            LinearGradient(
+                                colors: [Color(red: 0.10, green: 0.72, blue: 0.36), Color(red: 0.06, green: 0.56, blue: 0.28)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(12)
+            }
+            .frame(minWidth: 230, idealWidth: 250, maxWidth: 280)
+        } detail: {
+            if let proj = store.selectedProject {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        // 顶部通知条
+                        if let msg = store.bannerMessage {
+                            HStack {
+                                Text(msg)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                Spacer()
+                                Button("关闭") { store.bannerMessage = nil }
+                                    .buttonStyle(.borderless)
+                                    .font(.system(size: 11))
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+
+                        // 工程头部卡片
+                        HStack(alignment: .center, spacing: 14) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack(spacing: 10) {
+                                    Text(proj.name)
+                                        .font(.system(size: 20, weight: .bold))
+                                    Text("当前持棒：\(holderDisplayName(proj.holder))")
+                                        .font(.system(size: 12, weight: .bold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 4)
+                                        .background(holderColor(proj.holder).opacity(0.18))
+                                        .foregroundColor(holderColor(proj.holder))
+                                        .clipShape(Capsule())
+                                    if proj.running {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("后台接力运行中…")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(.orange)
+                                    }
+                                }
+                                HStack(spacing: 12) {
+                                    Text(proj.path)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                    Button("打开文件夹") {
+                                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: proj.path)
+                                    }
+                                    .font(.system(size: 11))
+                                    .buttonStyle(.link)
+                                    Text("｜ 快照 \(proj.snapshotsCount) 份")
+                                        .font(.system(size: 11.5))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            Spacer()
+
+                            if proj.holder != "claude" {
+                                Button(action: {
+                                    store.runRelayCommand(
+                                        title: "收工并交回 Claude (\(proj.name))",
+                                        args: ["takeback", "--project", proj.code],
+                                        triggerDonateAfter: true
+                                    )
+                                }) {
+                                    Label("收工 / 交回 Claude", systemImage: "arrow.uturn.backward.circle.fill")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(Color(red: 0.85, green: 0.46, blue: 0.34))
+                                .disabled(store.isBusy)
+                            } else {
+                                Button(action: {
+                                    store.copyPrompt(toolName: "AI 助手")
+                                }) {
+                                    Label("复制接力提示词", systemImage: "doc.on.doc")
+                                        .font(.system(size: 12))
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .padding(14)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.controlBackgroundColor)))
+
+                        // 五家 AI 接力矩阵（海外 + 国内）
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("把接力棒交给谁？（一键拍快照 + 锁定原工具 + 传递上下文）")
+                                    .font(.system(size: 14, weight: .bold))
+                                Spacer()
+                                if proj.holder != "claude" {
+                                    Text("提示：当前在 \(holderDisplayName(proj.holder)) 手里，点右上角“收工 / 交回 Claude”后可再传给别家")
+                                        .font(.system(size: 11.5))
+                                        .foregroundColor(.orange)
+                                }
+                            }
+
+                            let canGive = (proj.holder == "claude") && !proj.running && store.liveEnabled && !store.isBusy
+
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                                // 1. 豆包工作台
+                                ToolCardView(
+                                    title: "豆包工作台 (Doubao)",
+                                    subtitle: "自动拍快照、锁住 Claude、复制完整工程上下文到剪贴板并打开豆包工作台，直接粘贴即可干活。",
+                                    badge: "国内主力 · 免配置",
+                                    color: holderColor("doubao"),
+                                    isCurrentHolder: proj.holder == "doubao",
+                                    canHandOff: canGive,
+                                    primaryLabel: "一键带上下文去豆包工作台",
+                                    primaryAction: {
+                                        store.runRelayCommand(
+                                            title: "交给豆包工作台 (\(proj.name))",
+                                            args: ["open", "--project", proj.code, "--tool", "doubao"],
+                                            triggerDonateAfter: true
+                                        )
+                                    },
+                                    secondaryLabel: "API 自动跑",
+                                    secondaryAction: {
+                                        store.runRelayCommand(
+                                            title: "豆包 API 后台接力 (\(proj.name))",
+                                            args: ["handoff", "--project", proj.code, "--to", "doubao"],
+                                            triggerDonateAfter: true
+                                        )
+                                    }
+                                )
+
+                                // 2. DeepSeek
+                                ToolCardView(
+                                    title: "DeepSeek (深度求索)",
+                                    subtitle: "自动拍快照、复制结构化提示词到剪贴板并唤醒 DeepSeek；或配置 API Key 后直接后台自动改文件。",
+                                    badge: "国内推理强模型",
+                                    color: holderColor("deepseek"),
+                                    isCurrentHolder: proj.holder == "deepseek",
+                                    canHandOff: canGive,
+                                    primaryLabel: "一键带上下文去 DeepSeek",
+                                    primaryAction: {
+                                        store.runRelayCommand(
+                                            title: "交给 DeepSeek (\(proj.name))",
+                                            args: ["open", "--project", proj.code, "--tool", "deepseek"],
+                                            triggerDonateAfter: true
+                                        )
+                                    },
+                                    secondaryLabel: "API 自动跑",
+                                    secondaryAction: {
+                                        store.runRelayCommand(
+                                            title: "DeepSeek API 后台接力 (\(proj.name))",
+                                            args: ["handoff", "--project", proj.code, "--to", "deepseek"],
+                                            triggerDonateAfter: true
+                                        )
+                                    }
+                                )
+
+                                // 3. Codex
+                                ToolCardView(
+                                    title: "OpenAI Codex",
+                                    subtitle: "支持调用本机 Codex CLI 无人值守分段执行并跑单元测试，也可以只拍快照自己去 Codex 里手动写。",
+                                    badge: store.settings.codexModel,
+                                    color: holderColor("codex"),
+                                    isCurrentHolder: proj.holder == "codex",
+                                    canHandOff: canGive,
+                                    primaryLabel: "让 Codex 后台自动接着做",
+                                    primaryAction: {
+                                        store.runRelayCommand(
+                                            title: "交给 Codex 自动执行 (\(proj.name))",
+                                            args: ["handoff", "--project", proj.code, "--to", "codex"],
+                                            triggerDonateAfter: true
+                                        )
+                                    },
+                                    secondaryLabel: "手动去 Codex",
+                                    secondaryAction: {
+                                        store.runRelayCommand(
+                                            title: "到 Codex 手动开工 (\(proj.name))",
+                                            args: ["open", "--project", proj.code, "--tool", "codex"],
+                                            triggerDonateAfter: true
+                                        )
+                                    }
+                                )
+
+                                // 4. Antigravity
+                                ToolCardView(
+                                    title: "Google Antigravity",
+                                    subtitle: "拍下快照并锁定 Claude 后去 Antigravity 窗口亲自开发，或调用 agy 命令行后台无人值守跑。",
+                                    badge: store.settings.agyModel,
+                                    color: holderColor("antigravity"),
+                                    isCurrentHolder: proj.holder == "antigravity",
+                                    canHandOff: canGive,
+                                    primaryLabel: "到 Antigravity 手动开工",
+                                    primaryAction: {
+                                        store.runRelayCommand(
+                                            title: "到 Antigravity 开工 (\(proj.name))",
+                                            args: ["open", "--project", proj.code, "--tool", "antigravity"],
+                                            triggerDonateAfter: true
+                                        )
+                                    },
+                                    secondaryLabel: "agy 后台跑",
+                                    secondaryAction: {
+                                        store.runRelayCommand(
+                                            title: "交给 Antigravity 自动执行 (\(proj.name))",
+                                            args: ["handoff", "--project", proj.code, "--to", "antigravity"],
+                                            triggerDonateAfter: true
+                                        )
+                                    }
+                                )
+                            }
+                        }
+
+                        // 下一步任务编辑器 (docs/STATE.md)
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label("下一步任务清单 (docs/STATE.md) — 接手的 AI 会直接读这里", systemImage: "checklist")
+                                    .font(.system(size: 13.5, weight: .bold))
+                                Spacer()
+                                if store.stateDirty {
+                                    Text("有未保存修改")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.orange)
+                                }
+                                Button("保存任务 (STATE.md)") {
+                                    store.saveStateMd()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+
+                            TextEditor(text: Binding(
+                                get: { store.editedStateMd },
+                                set: {
+                                    store.editedStateMd = $0
+                                    store.stateDirty = true
+                                }
+                            ))
+                            .font(.system(size: 12.5, design: .monospaced))
+                            .frame(minHeight: 130, maxHeight: 170)
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.textBackgroundColor)))
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.25), lineWidth: 1))
+                        }
+
+                        // 快照管理与运行输出面板
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label("快照安全箱与实时执行日志", systemImage: "clock.arrow.circlepath")
+                                    .font(.system(size: 13.5, weight: .bold))
+                                Spacer()
+                                Button("立即拍一份快照") {
+                                    store.runRelayCommand(title: "手动拍快照 (\(proj.name))", args: ["snapshot", proj.code])
+                                }
+                                .controlSize(.small)
+
+                                Button("解包最近快照到新文件夹对照") {
+                                    store.runRelayCommand(title: "恢复快照到新目录 (\(proj.name))", args: ["restore", proj.code])
+                                }
+                                .controlSize(.small)
+                                .disabled(proj.snapshotsCount == 0)
+
+                                Button("清空日志显示") {
+                                    store.consoleOutput = ""
+                                }
+                                .controlSize(.small)
+                            }
+
+                            ScrollView {
+                                Text(store.consoleOutput)
+                                    .font(.system(size: 11.5, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                                    .padding(8)
+                            }
+                            .frame(height: 135)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.86)))
+                            .foregroundColor(Color(red: 0.78, green: 0.96, blue: 0.82))
+                        }
+                    }
+                    .padding(18)
+                }
+            } else {
+                VStack(spacing: 14) {
+                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundColor(.accentColor)
+                    Text("还没有添加任何工程")
+                        .font(.system(size: 18, weight: .bold))
+                    Text("点击下方按钮选择一个你的代码文件夹，即可在 Claude、Codex、Antigravity、豆包工作台、DeepSeek 之间一键接力。")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
+                    Button("➕ 添加第一个工程文件夹") {
+                        store.addProjectInteractive()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .automatic) {
+                Button(action: { store.refresh(syncEditor: true) }) {
+                    Label("刷新状态", systemImage: "arrow.clockwise")
+                }
+                Button(action: { store.addProjectInteractive() }) {
+                    Label("添加工程", systemImage: "folder.badge.plus")
+                }
+                Button(action: { store.showSettingsSheet = true }) {
+                    Label("模型与 API", systemImage: "gearshape")
+                }
+                Button(action: { store.showDonateSheet = true }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "heart.fill")
+                            .foregroundColor(.pink)
+                        Text("打赏支持")
+                            .fontWeight(.semibold)
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $store.showDonateSheet) {
+            DonateSheetView().environmentObject(store)
+        }
+        .sheet(isPresented: $store.showSettingsSheet) {
+            SettingsSheetView().environmentObject(store)
+        }
+    }
+}
+
+// MARK: - AppDelegate（同时管理独立桌面窗口 + 顶部状态栏快捷入口）
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    let store = RelayStore()
+    var mainWindow: NSWindow?
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var timer: Timer?
 
-    func applicationDidFinishLaunching(_ n: Notification) {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        store.onStateUpdated = { [weak self] in
+            self?.updateStatusTitle()
+        }
+        setupMainWindow()
+        setupStatusBar()
+        store.refresh(syncEditor: true)
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self = self, !self.store.isBusy else { return }
+            self.store.refresh(syncEditor: false)
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return true
+    }
+
+    func setupMainWindow() {
+        let contentView = MainWindowView().environmentObject(store)
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.center()
+        win.title = "AI 接力台 (Claude · Codex · Antigravity · 豆包工作台 · DeepSeek)"
+        win.contentView = NSHostingView(rootView: contentView)
+        win.isReleasedWhenClosed = false
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        self.mainWindow = win
+    }
+
+    @objc func showMainWindow() {
+        if mainWindow == nil {
+            setupMainWindow()
+        } else {
+            mainWindow?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @objc func openDonateFromMenu() {
+        showMainWindow()
+        store.showDonateSheet = true
+    }
+
+    func setupStatusBar() {
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
-        item.menu = menu
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.refreshAsync() }
+        statusItem.menu = menu
+        updateStatusTitle()
     }
 
-    func refreshAsync() {
-        DispatchQueue.global().async {
-            let s = loadState()
-            DispatchQueue.main.async { self.state = s; self.updateTitle() }
-        }
-    }
-
-    func refresh() {
-        state = loadState()
-        updateTitle()
-    }
-
-    func updateTitle() {
-        let base = L("接力", "Relay")
-        var t = base
-        if !state.diskOK { t = base + L(" ⚠︎盘没插", " ⚠︎ not found") }
-        else if state.error != nil { t = base + " ⚠︎" }
-        else if !state.live { t = base + L("·关", " · off") }
-        else {
-            let away = state.projects.filter { $0.holder != "claude" }
-            if !away.isEmpty {
-                t = base + " ▶ " + holderName(away[0].holder) + (away.count > 1 ? "×\(away.count)" : "")
-            }
-        }
-        item.button?.title = t
-    }
-
-    // 每次点开菜单都现读一遍状态，现搭菜单
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        refresh()
-        menu.removeAllItems()
-        if !state.diskOK {
-            addInfo(menu, L("没找到接力程序所在的盘", "Relay folder not found"))
-            addInfo(menu, L("接力程序在那块盘上，请先插上再点开这里。", "Plug in the drive that holds it, then open this menu again."))
-            menu.addItem(.separator())
-            if Bundle.main.path(forResource: "switch-offline", ofType: "command") != nil {
-                add(menu, L("Claude 被拦着干不了活？临时关掉拦截…", "Claude blocked? Temporarily turn the guard off…"), #selector(offlineSwitch))
-            }
-        } else if let e = state.error {
-            addInfo(menu, L("接力程序出了点问题：", "The relay hit a problem:"))
-            addInfo(menu, String(e.prefix(80)))
-            add(menu, L("打开总开关菜单（修复、看日志）…", "Open the switch menu (repair, logs)…"), #selector(openSwitch))
+    func updateStatusTitle() {
+        var title = "⚡ 接力台"
+        if !store.liveEnabled {
+            title = "⚡ 接力台·关"
         } else {
-            addInfo(menu, L("总开关：", "Master switch: ") + (state.live ? L("开", "on") : L("关（接力不干活）", "off (relay inactive)")))
-            for p in state.projects {
-                addInfo(menu, L("\(p.name)：在 \(holderName(p.holder)) 手里", "\(p.name): held by \(holderName(p.holder))") + (p.running ? L("（正在跑）", " (running)") : ""))
+            let away = store.projects.filter { $0.holder != "claude" }
+            if !away.isEmpty {
+                title = "⚡ 接力 ▶ " + holderDisplayName(away[0].holder)
             }
-            if !state.diffs.isEmpty { addInfo(menu, L("⚠︎ 锁和抄本不一致，请到“更多”里点修复", "⚠︎ Lock and its copy disagree — use More… → repair")) }
-            menu.addItem(.separator())
-
-            add(menu, state.live ? L("关掉总开关", "Turn master switch off") : L("打开总开关", "Turn master switch on"), #selector(toggleLive))
-            menu.addItem(.separator())
-
-            let give = NSMenu()
-            give.autoenablesItems = false
-            for p in state.projects {
-                let ok = p.holder == "claude" && !p.running && state.live
-                let mi = add(give, ok ? p.name : busyLabel(p),
-                             #selector(handoff(_:)), enabled: ok)
-                mi.representedObject = p.code
-            }
-            if state.projects.isEmpty { addInfo(give, L("还没有登记任何工程", "No projects registered yet")) }
-            let giveItem = NSMenuItem(title: L("交给 Codex（它自己接着做）", "Hand off to Codex (runs unattended)"), action: nil, keyEquivalent: "")
-            giveItem.submenu = give
-            menu.addItem(giveItem)
-
-            let agyMenu = NSMenu()
-            agyMenu.autoenablesItems = false
-            for p in state.projects {
-                let ok = p.holder == "claude" && !p.running && state.live
-                let mi = add(agyMenu, ok ? p.name : busyLabel(p),
-                             #selector(handoffAgy(_:)), enabled: ok)
-                mi.representedObject = p.code
-            }
-            if state.projects.isEmpty { addInfo(agyMenu, L("还没有登记任何工程", "No projects registered yet")) }
-            let agyItem = NSMenuItem(title: L("交给 Antigravity（它自己接着做）", "Hand off to Antigravity (runs unattended)"), action: nil, keyEquivalent: "")
-            agyItem.submenu = agyMenu
-            menu.addItem(agyItem)
-
-            let openMenu = NSMenu()
-            openMenu.autoenablesItems = false
-            for p in state.projects {
-                let ok = p.holder == "claude" && !p.running && state.live
-                let mi = add(openMenu, ok ? p.name : busyLabel(p),
-                             #selector(openSession(_:)), enabled: ok)
-                mi.representedObject = p.code
-            }
-            if state.projects.isEmpty { addInfo(openMenu, L("还没有登记任何工程", "No projects registered yet")) }
-            let openItem = NSMenuItem(title: L("到 Antigravity 开工（拍快照，我自己去做）", "Work in Antigravity myself (snapshot only)"), action: nil, keyEquivalent: "")
-            openItem.submenu = openMenu
-            menu.addItem(openItem)
-
-            let back = NSMenu()
-            back.autoenablesItems = false
-            let away = state.projects.filter { $0.holder != "claude" }
-            for p in away {
-                let mi = add(back, L("\(p.name)（现在在 \(holderName(p.holder)) 手里）", "\(p.name) (held by \(holderName(p.holder)))"), #selector(takeback(_:)))
-                mi.representedObject = p.code
-            }
-            if away.isEmpty { addInfo(back, L("现在所有工程都在 Claude 手里", "Claude holds every project right now")) }
-            let backItem = NSMenuItem(title: L("收工 / 交回 Claude", "Done / Give back to Claude"), action: nil, keyEquivalent: "")
-            backItem.submenu = back
-            menu.addItem(backItem)
-
-            menu.addItem(.separator())
-            add(menu, L("看详细状态…", "Detailed status…"), #selector(showStatus))
-            add(menu, L("更多（修复、看日志、撤回只读）…", "More (repair, logs, undo read-only)…"), #selector(openSwitch))
         }
+        statusItem.button?.title = title
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let openItem = NSMenuItem(title: "🖥 打开 AI 接力台主窗口…", action: #selector(showMainWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let donateItem = NSMenuItem(title: "❤️ 觉得好用？任意金额打赏支持…", action: #selector(openDonateFromMenu), keyEquivalent: "")
+        donateItem.target = self
+        menu.addItem(donateItem)
+
         menu.addItem(.separator())
-        add(menu, L("退出接力图标", "Quit Relay menu"), #selector(quit))
-    }
 
-    @discardableResult
-    func add(_ menu: NSMenu, _ title: String, _ sel: Selector, enabled: Bool = true) -> NSMenuItem {
-        let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
-        mi.target = self
-        mi.isEnabled = enabled
-        menu.addItem(mi)
-        return mi
-    }
-
-    func addInfo(_ menu: NSMenu, _ title: String) {
-        let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        mi.isEnabled = false
-        menu.addItem(mi)
-    }
-
-    func alert(_ text: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = L("AI 接力", "AI Relay")
-        a.informativeText = text
-        a.addButton(withTitle: L("好", "OK"))
-        a.runModal()
-    }
-
-    // 在“终端”窗口里跑一条 relay 命令，用户能看到进度。做法：写一个临时 .command 文件再打开它。
-    func runInTerminal(title: String, relayArgs: [String]) {
-        guard FileManager.default.fileExists(atPath: RELAY) else {
-            alert(L("没找到接力程序所在的盘，这次什么都没做。请先插上那块盘。", "Relay folder not found; nothing was done. Plug in its drive first."))
-            return
+        for p in store.projects {
+            let info = NSMenuItem(title: "· \(p.name)：在 \(holderDisplayName(p.holder)) 手里", action: nil, keyEquivalent: "")
+            info.isEnabled = false
+            menu.addItem(info)
         }
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("relay-menubar")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let file = dir.appendingPathComponent(title + ".command")
-        let quoted = relayArgs.map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }.joined(separator: " ")
-        let script = """
-        #!/bin/sh
-        clear
-        echo "=== \(title) ==="
-        \(PY) '\(RELAY)' \(quoted)
-        echo
-        echo "\(L("（做完了，这个窗口可以关掉。）", "(Done. You can close this window.)"))"
 
-        """
-        do {
-            try script.write(to: file, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
-        } catch {
-            alert(L("没能准备好要运行的命令：", "Could not prepare the command: ") + error.localizedDescription)
-            return
-        }
-        NSWorkspace.shared.open(file)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 AI 接力台", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
     }
 
-    @objc func handoff(_ sender: NSMenuItem) {
-        guard let code = sender.representedObject as? String else { return }
-        runInTerminal(title: L("交给 Codex", "Hand off to Codex") + " - \(code)", relayArgs: ["handoff", "--project", code])
+    @objc func quitApp() {
+        NSApp.terminate(nil)
     }
-
-    @objc func handoffAgy(_ sender: NSMenuItem) {
-        guard let code = sender.representedObject as? String else { return }
-        runInTerminal(title: L("交给 Antigravity", "Hand off to Antigravity") + " - \(code)", relayArgs: ["handoff", "--project", code, "--to", "antigravity"])
-    }
-
-    @objc func openSession(_ sender: NSMenuItem) {
-        guard let code = sender.representedObject as? String else { return }
-        runInTerminal(title: L("到 Antigravity 开工", "Open in Antigravity") + " - \(code)", relayArgs: ["open", "--project", code, "--tool", "antigravity"])
-    }
-
-    @objc func takeback(_ sender: NSMenuItem) {
-        guard let code = sender.representedObject as? String else { return }
-        runInTerminal(title: L("交回 Claude", "Give back to Claude") + " - \(code)", relayArgs: ["takeback", "--project", code])
-    }
-
-    @objc func openSwitch() {
-        runInTerminal(title: L("接力总开关", "Relay switch"), relayArgs: ["switch"])
-    }
-
-    @objc func toggleLive() {
-        let turnOn = !state.live
-        if !turnOn {
-            NSApp.activate(ignoringOtherApps: true)
-            let a = NSAlert()
-            a.messageText = L("关掉接力总开关？", "Turn the relay master switch off?")
-            a.informativeText = L("关掉后所有接力钩子都不干活：不拦、不记。随时可以从这个菜单再打开。", "While off, all relay hooks do nothing: no guarding, no logging. Turn it back on from this menu any time.")
-            a.addButton(withTitle: L("取消", "Cancel"))
-            a.addButton(withTitle: L("关掉", "Turn off"))
-            if a.runModal() != .alertSecondButtonReturn { return }
-        }
-        let (rc, out) = run([PY, HELPER, "live", turnOn ? "on" : "off"])
-        let s = parseState(out)
-        if rc != 0 || s.error != nil {
-            alert(L("没改成：", "Change failed: ") + (s.error ?? String(out.suffix(300))))
-        }
-        refresh()
-    }
-
-    @objc func showStatus() {
-        let (_, out) = run([PY, RELAY, "status"])
-        alert(out.isEmpty ? L("读不到状态。", "Cannot read status.") : out)
-    }
-
-    @objc func offlineSwitch() {
-        // 盘不在时用的应急办法：直接跑随程序带着的“接力总开关”启动文件副本（它自己会弹窗问）。
-        guard let path = Bundle.main.path(forResource: "switch-offline", ofType: "command") else { return }
-        DispatchQueue.global().async { _ = run(["/bin/sh", path], timeout: 600) }
-    }
-
-    @objc func quit() { NSApp.terminate(nil) }
 }
 
 let app = NSApplication.shared
-let delegate = App()
+let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()

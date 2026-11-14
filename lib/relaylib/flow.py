@@ -6,8 +6,8 @@ import re
 import subprocess
 import time
 
-from . import agy, audit, baton, codex, common, gitiso, guard, lock, manifest, media, snapshot, ui
-from .common import HOLDER_ANTIGRAVITY, HOLDER_CLAUDE, HOLDER_CODEX, HOLDER_NAMES, RelayError
+from . import agy, audit, baton, codex, common, domestic, gitiso, guard, lock, manifest, media, snapshot, ui
+from .common import HOLDER_ANTIGRAVITY, HOLDER_CLAUDE, HOLDER_CODEX, HOLDER_DEEPSEEK, HOLDER_DOUBAO, HOLDER_NAMES, RelayError
 from .redact import one_line, wrap_untrusted
 
 
@@ -75,15 +75,15 @@ def handback_status(path):
 
 
 def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
-    """无人值守接力：交给 Codex（默认）或 Antigravity，让它自己分段接着做。"""
-    if to not in (HOLDER_CODEX, HOLDER_ANTIGRAVITY):
+    """无人值守接力：交给 Codex（默认）、Antigravity、豆包工作台或 DeepSeek，让它自己分段接着做。"""
+    if to not in (HOLDER_CODEX, HOLDER_ANTIGRAVITY, HOLDER_DOUBAO, HOLDER_DEEPSEEK):
         raise RelayError("不认识这个工具：%s" % to)
     tname = HOLDER_NAMES[to]
     proj = common.project(cfg, code)
     path = common.real(proj["path"])
     name = proj.get("name") or code
     if not cfg.get("live_enabled"):
-        raise RelayError("接力总开关现在是关着的。要用请先双击“接力总开关”打开。")
+        raise RelayError("接力总开关现在是关着的。要用请先打开总开关。")
     if not os.path.isdir(path):
         raise RelayError("找不到工程文件夹：%s" % path)
     busy = lock.Busy(code)
@@ -92,7 +92,7 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
     try:
         cur_holder = lock.holder(code)
         if cur_holder != HOLDER_CLAUDE:
-            raise RelayError("“%s”现在已经在 %s 手里了，不能重复交出。要收回请双击“交回 Claude”。" % (name, cur_holder))
+            raise RelayError("“%s”现在已经在 %s 手里了，不能重复交出。要收回请点“交回 Claude”。" % (name, cur_holder))
         if from_chat:
             if ui.ask("要把“%s”交给 %s 接着做吗？" % (name, tname), ["取消", "交给 %s" % tname], "交给 %s" % tname) != "交给 %s" % tname:
                 audit.log(code, by, "交出取消", "确认框里点了取消")
@@ -120,6 +120,10 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
                 audit.log(code, "relay", "权限", "本次接力 Antigravity 为整机全权（跳过权限确认）")
             else:
                 print("注意：这次 Antigravity 只能改工程里的文件，跑不了终端命令（配置 antigravity.permissions 不是 full）。", flush=True)
+        elif to in (HOLDER_DOUBAO, HOLDER_DEEPSEEK):
+            if not domestic.has_api_key(cfg, to):
+                raise RelayError("尚未配置 %s 的 API Key。请在右上角“模型与 API 设置”中填写 API Key，或使用“一键带上下文去 %s”手动接力模式。" % (tname, tname))
+            print("③ 这次接力通过 API 交给 %s 自动执行。" % tname, flush=True)
         else:
             if codex.network_allowed(cfg):
                 print("③ 这次接力允许 Codex 上网（配置里开着），不做禁网检查。", flush=True)
@@ -149,11 +153,12 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
 
 def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX):
     tname = HOLDER_NAMES[to]
-    runner = agy if to == HOLDER_ANTIGRAVITY else codex
     c = dict(cfg["codex"])
     if to == HOLDER_ANTIGRAVITY:          # 没单独写的时限、段数沿用 Codex 的
         c.update({k: v for k, v in (cfg.get("antigravity") or {}).items()
                   if k in ("max_segments", "segment_timeout_min", "total_timeout_min")})
+    elif to in (HOLDER_DOUBAO, HOLDER_DEEPSEEK):
+        c.update({"max_segments": 2, "segment_timeout_min": 10, "total_timeout_min": 30})
     max_seg = int(c.get("max_segments", 4))
     seg_timeout = float(c.get("segment_timeout_min", 20)) * 60
     total_timeout = float(c.get("total_timeout_min", 90)) * 60
@@ -170,10 +175,18 @@ def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX):
         lock.update_lock(code, segment=seg)
         audit.log(code, to, "段开始", "第 %d 段" % seg)
         print("⑤ %s 第 %d 段开始（最多 %d 段，每段最长 %d 分钟）…" % (tname, seg, max_seg, seg_timeout // 60), flush=True)
-        res = runner.run_segment(
-            cfg, code, path, seg, runner.load_prompt(cfg, seg, max_seg), is_git,
-            min(seg_timeout, max(30.0, total_timeout - (time.time() - start))), stop_flag(code),
-            on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}))
+        rem_timeout = min(seg_timeout, max(30.0, total_timeout - (time.time() - start)))
+        if to in (HOLDER_DOUBAO, HOLDER_DEEPSEEK):
+            res = domestic.run_segment(
+                cfg, to, code, path, seg, domestic.load_prompt(cfg, seg, max_seg), is_git,
+                rem_timeout, stop_flag(code),
+                on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}))
+        else:
+            runner = agy if to == HOLDER_ANTIGRAVITY else codex
+            res = runner.run_segment(
+                cfg, code, path, seg, runner.load_prompt(cfg, seg, max_seg), is_git,
+                rem_timeout, stop_flag(code),
+                on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}))
         post = manifest.take(path)
         d = manifest.diff(prev, post, raw_dirs)
         test, test_tail = run_tests(proj, path)
@@ -274,13 +287,21 @@ def open_session(cfg, code, tool, by="user"):
             "guard_fp": {"protected": manifest.fingerprint_protected(pre),
                          "git_config": guard.git_config_fp(path)}})
         baton.rewrite(code, path)
+        clip_prompt = domestic.build_clipboard_prompt(code, path, tname)
+        copied = domestic.copy_to_clipboard(clip_prompt)
+        launched = ""
+        if tool in (HOLDER_DOUBAO, HOLDER_DEEPSEEK) and not os.environ.get("RELAY_UI_ANSWERS"):
+            launched = domestic.open_tool_workspace(cfg, tool, path)
     finally:
         busy.release()
-    msg = ("“%s”已开工，开工前的样子已拍了快照（%s）。\n\n现在可以去 %s 里打开这个文件夹干活：\n%s\n\n"
-           "这期间 Claude 在这个工程里只能看、不能改。做完后回到菜单栏“接力”点“收工 / 交回 Claude”。" % (
-               name, snap["id"], tname, path))
+    extra_tip = "\n✅ 已自动将【工程上下文 + 下一步任务】复制到系统剪贴板，过去直接 Cmd+V 粘贴即可！" if copied else ""
+    if launched:
+        extra_tip += "\n🚀 " + launched
+    msg = ("“%s”已开工，开工前的样子已拍了快照（%s）。%s\n\n现在可以去 %s 里打开这个文件夹干活：\n%s\n\n"
+           "这期间 Claude 在这个工程里只能看、不能改。做完后回到 AI 接力台点“收工 / 交回 Claude”。" % (
+               name, snap["id"], extra_tip, tname, path))
     ui.info(msg)
-    return {"started": True, "message": msg, "snapshot": snap["id"]}
+    return {"started": True, "message": msg, "snapshot": snap["id"], "copied": copied}
 
 
 def takeback(cfg, code, by="user"):

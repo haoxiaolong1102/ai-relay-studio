@@ -13,8 +13,16 @@ CONFIG = Path(os.environ.get("RELAY_CONFIG") or ROOT / "config" / "projects.json
 HOLDER_CLAUDE = "claude"
 HOLDER_CODEX = "codex"
 HOLDER_ANTIGRAVITY = "antigravity"
-HOLDERS = (HOLDER_CLAUDE, HOLDER_CODEX, HOLDER_ANTIGRAVITY)
-HOLDER_NAMES = {HOLDER_CLAUDE: "Claude", HOLDER_CODEX: "Codex", HOLDER_ANTIGRAVITY: "Antigravity"}
+HOLDER_DOUBAO = "doubao"
+HOLDER_DEEPSEEK = "deepseek"
+HOLDERS = (HOLDER_CLAUDE, HOLDER_CODEX, HOLDER_ANTIGRAVITY, HOLDER_DOUBAO, HOLDER_DEEPSEEK)
+HOLDER_NAMES = {
+    HOLDER_CLAUDE: "Claude",
+    HOLDER_CODEX: "Codex",
+    HOLDER_ANTIGRAVITY: "Antigravity",
+    HOLDER_DOUBAO: "豆包工作台",
+    HOLDER_DEEPSEEK: "DeepSeek",
+}
 
 
 class RelayError(Exception):

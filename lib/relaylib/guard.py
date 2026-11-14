@@ -110,16 +110,18 @@ def decide(hook_input, cfg=None):
         lk = lock.read_lock(code)          # 锁坏了会抛异常 → 调用方拦下
         if lk["holder"] == common.HOLDER_CLAUDE:
             continue
+        hname = common.HOLDER_NAMES.get(lk["holder"], lk["holder"])
+        deny_msg = "现在是 %s 在干活，Claude 只能看不能改。要收回请点“AI 接力台”里的“收工 / 交回 Claude”。" % hname
         if tool in WRITE_TOOLS:
-            return False, DENY_MSG, code
+            return False, deny_msg, code
         if tool == "Bash":
             ok, why = bash_readonly(ti.get("command"), git_ok=_git_config_ok(proj["path"], lk))
             if not ok:
-                return False, "%s（这条命令没放行：%s。只读的 ls/cat/head/tail/grep/rg/wc/stat/file、git status/log/show/diff 可以用。）" % (DENY_MSG, why), code
+                return False, "%s（这条命令没放行：%s。只读的 ls/cat/head/tail/grep/rg/wc/stat/file、git status/log/show/diff 可以用。）" % (deny_msg, why), code
             continue
         if tool.startswith("mcp__"):
             if tool in (proj.get("readonly_mcp") or []):
                 continue
-            return False, "%s（外接工具 %s 没登记为只读，先拦下。）" % (DENY_MSG, tool), code
+            return False, "%s（外接工具 %s 没登记为只读，先拦下。）" % (deny_msg, tool), code
         # 其它工具（Read、Grep 等）本来就不该进到这里；进来了就放行
     return True, "", None

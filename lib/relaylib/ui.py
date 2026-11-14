@@ -37,7 +37,7 @@ def _osascript(script):
 def info(msg):
     """只有一个“好”按钮的提示。"""
     print("\n【提示】%s\n" % msg, flush=True)
-    if os.environ.get("RELAY_UI_ANSWERS"):
+    if os.environ.get("RELAY_UI_ANSWERS") or os.environ.get("RELAY_NO_POPUP"):
         return
     _osascript('display dialog %s with title %s buttons {"好"} default button 1' % (_q(msg[:1500]), _q(TITLE)))
 

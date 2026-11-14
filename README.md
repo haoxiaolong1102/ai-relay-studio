@@ -1,114 +1,74 @@
-# ai-relay
+# ⚡ AI 接力台 (AI Relay Studio)
 
-**English** | [简体中文](README.zh-CN.md)
+**Claude 额度用光了、项目做到一半怎么办？**  
+把同一个工程像接力棒一样在 **Claude Code、Gemini (Antigravity)、OpenAI Codex、豆包工作台、DeepSeek** 五家工具之间一键接力：**零上下文断档、零重复消耗 Token、单写锁防覆盖、自动快照与 Git 隔离分支**。
 
-Pass one project between Claude Code, Codex and Antigravity like a relay baton — so when one subscription runs out of quota, another keeps working on the same folder, and you can always see who changed what and get back to where you were.
+---
 
-A small macOS menu-bar item plus a Python command (`bin/relay`). Standard library only, no server, no API keys: it drives the official command-line tools you are already signed in to.
+## 💡 为什么要做这个工具？（真实痛点）
 
-> Status: a personal tool, published as-is (v0.1). It works on the author's Mac; read [Limits](#limits) and [What has been tested](#what-has-been-tested) before trusting it with real work.
+平时同时跑好几个项目时，最崩溃的瞬间就是：**Claude 额度突然到期了，充值额度也见底了，但手头的项目才做到一半。**
 
-## Why
+以前切到 **Gemini (Antigravity)**、**Codex**、**豆包** 或 **DeepSeek** 接着干时，总会遇到两个大坑：
+1. **换过去断档**：新的 AI 根本不知道前因后果，你得重新花大把 Token 让它读整个项目、重新解释做到哪一步了。
+2. **切回来又断档**：等你在别的工具改完、Claude 额度恢复再回来时，Claude 又懵了——还得再消耗一遍 Token 让它重新了解进度，甚至两边同时改文件互相覆盖、把代码改乱。
 
-Each AI coding subscription has its own quota window. When Claude stops answering mid-task, the usual options are to wait or to re-explain the whole project to another tool and hope the two don't overwrite each other. ai-relay turns that hand-over into one click:
+**「AI 接力台」就是为了彻底解决这个断档问题而生的原生 macOS 桌面小软件：**
+- **一键传棒，自动带走上下文**：点一下要接手的 AI，软件自动把「工程结构 + 上一轮刚改了哪些文件 + 下一步任务 (`docs/STATE.md`) + 交接记录 (`BATON.md`)」打包好（支持一键复制到剪贴板直接粘贴，或后台自动调用 CLI / API 接着跑）。
+- **同一时间只有一个在写**：交出期间，Claude Code 在该工程下被钩子自动限制为只读，素材目录（`raw/`）自动上系统级只读锁。
+- **无痕 Git 隔离分支 + 快照兜底**：接手的 AI 改了什么，交回时用临时索引单独存到 `relay/<工具>/<时间>` 分支，**完全不动你当前的分支和工作区**；每次交出/交回前自动拍快照，随时可一键还原对比。
 
-- **One writer at a time.** A lock says who holds the project. While Codex or Antigravity holds it, Claude Code is limited to read-only in that project by a hook.
-- **Nothing is lost.** A snapshot is taken before every hand-off, and a per-file manifest shows exactly what changed while the other tool had it.
-- **The next tool knows what to do.** A baton file (`docs/relay/BATON.md`) carries the project state forward; the tool writes back a hand-back note (`docs/relay/HANDBACK.md`).
-- **Git stays clean.** The other tool's work is recorded on its own branch, `relay/<tool>/<timestamp>`, authored as that tool. Your current branch, index and working tree are never touched.
+---
 
-## What it does
+## ✨ 核心特性（桌面增强版 v1.0）
 
-| You want to… | Menu item | Command |
-|---|---|---|
-| Let Codex continue unattended | Hand off to Codex | `relay handoff --project X` |
-| Let Antigravity continue unattended | Hand off to Antigravity | `relay handoff --project X --to antigravity` |
-| Work in Antigravity yourself (snapshot + lock only, no model started) | Work in Antigravity myself | `relay open --project X --tool antigravity` |
-| Give the project back to Claude | Done / Give back to Claude | `relay takeback --project X` |
-| See who holds what | Detailed status… | `relay status` |
-| Turn everything off, repair, view logs | Master switch / More… | `relay switch` |
-| Look at the project as it was before the hand-off | — | `relay restore X` (extracts to a new folder) |
+- 🖥 **原生 macOS 桌面应用（SwiftUI）**：独立左右分栏主窗口 + 程序坞（Dock）图标 + 顶部菜单栏快捷入口，告别黑框终端弹窗。
+- 🤖 **五大模型全打通（海外 3 家 + 国内 2 家）**：
+  - **Claude Code**：主力持棒 + `PreToolUse` / `PostToolUse` / `Stop` 钩子自动记录与只读保护。
+  - **Google Antigravity (Gemini)**：支持手动开工（自动拍快照+复制上下文）与 `agy` 命令行后台无人值守分段执行。
+  - **OpenAI Codex**：支持 Codex CLI 无人值守分段执行并自动跑单元测试，也支持手动开工。
+  - **豆包工作台 (Doubao)**：支持「一键带上下文唤醒豆包工作台（免配 Key，过去直接 `Cmd+V`）」与火山方舟 API 后台自动改代码。
+  - **DeepSeek (深度求索)**：支持「一键带上下文唤醒 DeepSeek（免配 Key）」与 `deepseek-chat` / `deepseek-reasoner` API 后台自动改代码。
+- 📂 **一键导入工程**：点击「添加工程」选择任意文件夹，自动补齐 `.gitignore`、自动生成 `docs/STATE.md`、自动注入 Claude 钩子，零手动配置。
+- 📝 **内置任务编辑器与实时控制台**：在窗口内直接编辑保存下一步任务（`docs/STATE.md`），实时查看快照与执行日志。
 
-An unattended hand-off runs in segments (by default up to 4 segments of 20 minutes, 90 minutes in total). After each segment the relay diffs the files, runs your project's test command and decides whether to continue. It stops on its own, with a plain-language reason, when the task is done, quota runs out, an action was denied, two segments made no progress, or something outside the allowed area was touched.
+---
 
-## How it works
+## 🚀 快速安装与使用
 
-```
-Claude Code ──hand off──▶ baton + snapshot + manifest ──▶ lock: codex / antigravity
-     ▲                                                          │
-     │                                              tool works in segments
-     │                                                          ▼
-     └──take back── manifest diff + isolated branch ◀── HANDBACK.md
-```
+### 环境要求
+- macOS 13 及以上（使用系统自带 `/usr/bin/python3` 与 `/usr/bin/swiftc`，**零第三方依赖**，无需 `pip install` 或 `npm install`）。
 
-- **Lock** — `state/locks/<project>.json`, mirrored to `~/.claude/relay-holders.json` so the guard still works when the relay folder sits on an unplugged external drive.
-- **Guard** — a Claude Code `PreToolUse` hook. If Claude does not hold the project, writes are refused; if the check itself fails, it also refuses (fail closed).
-- **Snapshot** — `git` archive for Git projects, `rsync --link-dest` for plain folders.
-- **Manifest** — per-file hashes before and after. The diff is the source of truth; whatever the tool *says* it did is treated as untrusted text.
-- **Isolated branch** — built with a temporary index and `git commit-tree`, then `git push <remote> <ref>:<ref>` (never forced). Changes that were already uncommitted at hand-off go into a separate preceding commit, so they are not attributed to the tool. Registered raw/asset folders and large new files are left out.
-- **Audit log** — every hand-off, snapshot, branch and push is written to `state/audit/`, with secrets redacted.
-
-## Requirements
-
-- macOS 13 or later, with the system Python (`/usr/bin/python3`, 3.9+). No packages to install.
-- [Claude Code](https://claude.com/claude-code) as the main tool (hooks and skills are used).
-- At least one of: the Codex CLI (ships inside the ChatGPT desktop app) or the Antigravity CLI (`agy`), signed in with your own account.
-- Xcode Command Line Tools if you want the menu-bar item (`swiftc`). The command line works without it.
-
-## Install
-
+### 一键安装
 ```bash
-git clone https://github.com/fatrabbit29/ai-relay.git
-cd ai-relay
+git clone https://github.com/haoxiaolong1102/ai-relay-studio.git
+cd ai-relay-studio
 sh install.sh
+open "$HOME/Applications/Relay.app"
 ```
 
-`install.sh` copies the example config, installs the hook shim to `~/.claude/relay-shim.sh`, installs two Claude Code skills, and builds `~/Applications/Relay.app`. It backs up anything it would overwrite and never edits a `settings.json`. Then:
-
-1. Edit `config/projects.json`: register your projects (absolute paths), set model names your plans actually offer, and choose permissions.
-2. For each project where Claude should be guarded, merge the `hooks` block from `config/claude-hooks.json` into that project's `.claude/settings.json`.
-3. Give each project a `docs/STATE.md` with a "下一步" (next steps) list. The first unfinished item is what the other tool will work on, so make it concrete.
-4. Run `/usr/bin/python3 bin/relay status`, then `open ~/Applications/Relay.app`.
-
-Self-tests (no model is called): `/usr/bin/python3 -m unittest discover -s tests -q`
-
-## Permissions and safety
-
-The example config is the conservative setting. You can widen it; understand what you give up.
-
-| Setting | Conservative (default in the example) | Wide open |
+### 常用命令行（也可完全在桌面界面点按钮操作）
+| 操作 | 桌面界面 | 命令行 |
 |---|---|---|
-| `codex.sandbox` | `workspace-write` — writes only inside the project | `danger-full-access` — no sandbox |
-| `codex.network_access` | `false` | `true` |
-| `antigravity.permissions` | `edits` — may edit files in the project, cannot run commands | `full` — skips every confirmation, whole machine |
-| `git.push` | `false` — branch stays local | `true` — pushes the isolated branch only |
+| 一键带上下文去豆包工作台 | 点击「一键带上下文去豆包工作台」 | `relay open --project <代号> --tool doubao` |
+| 一键带上下文去 DeepSeek | 点击「一键带上下文去 DeepSeek」 | `relay open --project <代号> --tool deepseek` |
+| 交给 Antigravity (Gemini) | 点击「到 Antigravity 手动开工」或「agy 后台跑」 | `relay open --project <代号> --tool antigravity` / `relay handoff --project <代号> --to antigravity` |
+| 交给 Codex 自动接着做 | 点击「让 Codex 后台自动接着做」 | `relay handoff --project <代号> --to codex` |
+| 收工并交回 Claude | 点击右上角「收工 / 交回 Claude」 | `relay takeback --project <代号>` |
+| 运行 113 项自测 | — | `/usr/bin/python3 -m unittest discover -s tests -q` |
 
-With the wide-open settings, the remaining protection is *detect and recover* (snapshot, manifest, isolated branch), not *prevent*. The fixed instructions in `config/codex_prompt.md` and `config/agy_prompt.md` (do not commit, do not delete, do not touch raw assets, do not upload code or data) are instructions to a model, not enforcement.
+---
 
-## Limits
+## ❤️ 觉得好用？打赏支持
 
-- The guard only covers Claude Code in projects where the hook is installed. Other apps, or you, editing the same folder are noticed afterwards by the manifest diff, not blocked.
-- Read-only protection of raw/asset folders is a speed bump: a process running as you can undo it.
-- Snapshots live on whatever disk you configure. If that is the same disk as the project, they fail together.
-- The menu follows the system language (Chinese or English). **Terminal output, dialogs and the built-in agent prompts are in Chinese only for now.**
-- Quota-exhaustion detection for Antigravity is keyword-based guesswork.
-- `bin/media_ask` (let Gemini listen to or watch a media file) is optional and its video route depends on a private helper that is not included.
-- Model names in the example config are placeholders. Use ones your plan offers.
+这个工具是从我自己在多模型切换时的真实痛点里打磨出来的，完全开源免费分享给大家。  
+如果它真的帮到了你、帮你省下了时间和 Token，欢迎给仓库点个 **Star ⭐️**，也可以在软件内点击 **「打赏支持」** 或直接微信扫码任意金额赞赏（哪怕几毛、一块钱，都是向我证明这个东西确实好用、确实帮到了大家！）：
 
-## What has been tested
+<p align="center">
+  <img src="menubar/donate_qr.png" width="300" alt="微信赞赏支持 Eason晓龙" />
+</p>
 
-- 113 automated tests with fake Codex/Antigravity executables: locking, guard, snapshots, manifests, hand-off flow, isolated branches, push failure handling.
-- Real runs on the author's machine: unattended hand-off to Codex and to Antigravity (`agy` 1.5.7) on small test projects, take-back, isolated branch pushed to a local bare remote.
-- **Not yet tested for real:** pushing to GitHub itself, multi-segment runs, real quota exhaustion, large repositories, any machine other than the author's.
+---
 
-## Terms of service
-
-ai-relay only launches each vendor's official command-line tool under your own signed-in account, one at a time, the way you could by hand. It does not share accounts, proxy requests or bypass limits. You are responsible for checking that unattended use fits the terms of the plans you pay for. This project is not affiliated with Anthropic, OpenAI or Google.
-
-## Uninstall
-
-Quit the menu item, then remove `~/Applications/Relay.app`, `~/.claude/relay-shim.sh`, `~/.claude/skills/relay-handoff`, `~/.claude/skills/relay-takeback`, `~/.claude/relay-holders.json`, the `hooks` block you merged into each project, and this folder. If you protected raw folders, run `relay unprotect <project>` first.
-
-## License
-
-MIT — see [LICENSE](LICENSE). Provided without warranty; keep your own backups.
+## 📄 许可证
+MIT License（见 [LICENSE](LICENSE)）。基于 [ai-relay](https://github.com/fatrabbit29/ai-relay) 核心底座升级构建。

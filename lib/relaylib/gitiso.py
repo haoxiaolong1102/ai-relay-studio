@@ -14,7 +14,7 @@ import subprocess
 
 from . import audit, common
 
-TOOL_NAMES = {"codex": "Codex", "antigravity": "Antigravity"}
+TOOL_NAMES = {"codex": "Codex", "antigravity": "Antigravity", "doubao": "豆包工作台", "deepseek": "DeepSeek"}
 
 
 def settings(cfg):
