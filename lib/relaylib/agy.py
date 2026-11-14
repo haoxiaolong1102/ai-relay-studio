@@ -41,10 +41,12 @@ def permissions(cfg):
     return settings(cfg)["permissions"]
 
 
-def build_cmd(cfg, prompt, timeout_s):
+def build_cmd(cfg, prompt, timeout_s, conversation_id=None):
     st = settings(cfg)
     cmd = [st["bin"], "-p", prompt, "--model", st["model"], "--output-format", "json",
            "--print-timeout", "%ds" % int(timeout_s)]
+    if conversation_id:
+        cmd += ["--conversation", str(conversation_id)]
     if st["permissions"] == "full":
         cmd.append("--dangerously-skip-permissions")
     else:
@@ -87,7 +89,7 @@ def _kill(proc, hard=False):
         pass
 
 
-def run_segment(cfg, code, project_path, seg, prompt, is_git, timeout_s, stop_flag=None, on_start=None):
+def run_segment(cfg, code, project_path, seg, prompt, is_git, timeout_s, stop_flag=None, on_start=None, conversation_id=None):
     runs = common.ensure_private_dir(common.STATE / "runs" / code)
     run_id = "%s-agy-seg%d" % (common.stamp(), seg)
     raw_file = str(runs / ("%s.raw.tmp" % run_id))
@@ -98,7 +100,7 @@ def run_segment(cfg, code, project_path, seg, prompt, is_git, timeout_s, stop_fl
     t0 = time.time()
     fd = os.open(raw_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        proc = subprocess.Popen(build_cmd(cfg, prompt, timeout_s), cwd=project_path, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(build_cmd(cfg, prompt, timeout_s, conversation_id=conversation_id), cwd=project_path, stdin=subprocess.DEVNULL,
                                 stdout=fd, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     finally:
         os.close(fd)

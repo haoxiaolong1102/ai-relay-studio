@@ -80,20 +80,22 @@ def cmd_status(a, cfg):
 def cmd_handoff(a, cfg):
     _heal(cfg)
     code = a.project or _pick(cfg, "claude", "交给 %s" % common.HOLDER_NAMES[a.to])
-    r = flow.handoff(cfg, code, by="claude-chat" if a.from_chat else "user", from_chat=a.from_chat, to=a.to)
+    r = flow.handoff(cfg, code, by="claude-chat" if a.from_chat else "user", from_chat=a.from_chat,
+                     to=a.to, source_thread=getattr(a, "source_thread", None), target_thread=getattr(a, "target_thread", None))
     print(r["message"])
 
 
 def cmd_takeback(a, cfg):
     _heal(cfg)
-    code = a.project or _pick(cfg, "codex", "交回 Claude")
-    print(flow.takeback(cfg, code)["message"])
+    code = a.project or _pick(cfg, "codex", "交回主力")
+    print(flow.takeback(cfg, code, to=getattr(a, "to", None))["message"])
 
 
 def cmd_open(a, cfg):
     _heal(cfg)
     code = a.project or _pick(cfg, "claude", "开工")
-    print(flow.open_session(cfg, code, a.tool)["message"])
+    print(flow.open_session(cfg, code, a.tool, source_thread=getattr(a, "source_thread", None),
+                            target_thread=getattr(a, "target_thread", None))["message"])
 
 
 def cmd_repair(a, cfg):
@@ -237,9 +239,9 @@ def main():
     ap = argparse.ArgumentParser(prog="relay", description="AI 接力")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("status"); p.add_argument("project", nargs="?"); p.set_defaults(fn=cmd_status)
-    p = sub.add_parser("handoff"); p.add_argument("--project"); p.add_argument("--from-chat", action="store_true"); p.add_argument("--to", default="codex", choices=["codex", "antigravity", "doubao", "deepseek"]); p.set_defaults(fn=cmd_handoff)
-    p = sub.add_parser("takeback"); p.add_argument("--project"); p.set_defaults(fn=cmd_takeback)
-    p = sub.add_parser("open"); p.add_argument("--project"); p.add_argument("--tool", default="antigravity", choices=["antigravity", "codex", "doubao", "deepseek"]); p.set_defaults(fn=cmd_open)
+    p = sub.add_parser("handoff"); p.add_argument("--project"); p.add_argument("--from-chat", action="store_true"); p.add_argument("--to", default="codex", choices=["codex", "antigravity", "doubao", "deepseek"]); p.add_argument("--source-thread"); p.add_argument("--target-thread"); p.set_defaults(fn=cmd_handoff)
+    p = sub.add_parser("takeback"); p.add_argument("--project"); p.add_argument("--to", choices=["claude", "codex"]); p.set_defaults(fn=cmd_takeback)
+    p = sub.add_parser("open"); p.add_argument("--project"); p.add_argument("--tool", default="antigravity", choices=["antigravity", "codex", "doubao", "deepseek", "claude"]); p.add_argument("--source-thread"); p.add_argument("--target-thread"); p.set_defaults(fn=cmd_open)
     p = sub.add_parser("switch"); p.set_defaults(fn=cmd_switch)
     p = sub.add_parser("repair"); p.set_defaults(fn=cmd_repair)
     p = sub.add_parser("snapshot"); p.add_argument("project"); p.set_defaults(fn=cmd_snapshot)

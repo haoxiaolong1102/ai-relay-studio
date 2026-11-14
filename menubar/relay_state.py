@@ -20,7 +20,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 sys.dont_write_bytecode = True
-from relaylib import audit, common, domestic, lock, snapshot  # noqa: E402
+from relaylib import audit, baton, common, domestic, lock, snapshot, threads  # noqa: E402
 
 
 def _read_text(path, limit=4000):
@@ -41,6 +41,7 @@ def state():
             "name": proj.get("name") or code,
             "path": ppath,
             "holder": "unknown",
+            "home_holder": "codex",
             "since": "",
             "segment": None,
             "running": False,
@@ -48,10 +49,13 @@ def state():
             "latest_snapshot": "",
             "state_md": "",
             "baton_md": "",
+            "codex_threads": [],
+            "binding": {},
         }
         try:
             lk = lock.read_lock(code)
             item["holder"] = lk["holder"]
+            item["home_holder"] = lk.get("home_holder") or ("codex" if lk["holder"] == "codex" else "claude")
             item["since"] = lk.get("since") or ""
             item["segment"] = lk.get("segment")
         except Exception as e:
@@ -70,7 +74,16 @@ def state():
         if ppath and os.path.isdir(ppath):
             item["state_md"] = _read_text(os.path.join(ppath, "docs", "STATE.md"), 8000)
             item["baton_md"] = _read_text(os.path.join(ppath, "docs", "relay", "BATON.md"), 8000)
+        try:
+            item["codex_threads"] = threads.list_codex_threads(ppath, limit=25)
+            item["binding"] = threads.get_binding(code)
+        except Exception:
+            pass
         projects.append(item)
+    try:
+        agy_convs = threads.list_agy_conversations(limit=25)
+    except Exception:
+        agy_convs = []
     try:
         diffs = lock.compare(cfg)
     except Exception as e:
@@ -97,6 +110,7 @@ def state():
         "ok": True,
         "live": bool(cfg.get("live_enabled")),
         "projects": projects,
+        "agy_conversations": agy_convs,
         "diffs": diffs,
         "logs": logs[-40:],
         "settings": settings_info,
@@ -164,8 +178,38 @@ def add_project(name, path):
         "readonly_mcp": [],
     }
     common.save_config(cfg)
+    # 新接入工程默认主力持棒者为 codex（适配日常主力用 Codex 的工作流）
+    common.ensure_private_dir(common.STATE / "locks")
+    common.atomic_write_json(lock.lock_file(code), {
+        "holder": "codex",
+        "home_holder": "codex",
+        "since": common.now_iso(),
+        "segment": 0,
+        "by": "user",
+        "seq": 1,
+    })
     lock.reconcile(cfg)
     audit.log(code, "user", "导入工程", "%s (%s)" % (name, real_path))
+    return state()
+
+
+def set_base_holder(code, holder_name):
+    cfg = common.load_config()
+    proj = common.project(cfg, code)
+    if holder_name not in ("codex", "claude"):
+        raise common.RelayError("主力持棒者只能设为 codex 或 claude")
+    common.ensure_private_dir(common.STATE / "locks")
+    cur = lock.read_lock(code)
+    new_lk = dict(cur)
+    new_lk["holder"] = holder_name
+    new_lk["home_holder"] = holder_name
+    new_lk["since"] = common.now_iso()
+    new_lk["by"] = "user"
+    new_lk["seq"] = int(cur.get("seq", 0)) + 1
+    common.atomic_write_json(lock.lock_file(code), new_lk)
+    lock.reconcile(cfg)
+    baton.rewrite(code, common.real(proj["path"]))
+    audit.log(code, "user", "切换主力", "主力持棒者设为 %s" % holder_name)
     return state()
 
 
@@ -241,6 +285,25 @@ def main():
             prompt = domestic.build_clipboard_prompt(args[1], proj["path"], tname)
             ok = domestic.copy_to_clipboard(prompt)
             print(json.dumps({"ok": ok, "prompt": prompt}, ensure_ascii=False))
+            return 0
+        if args[:1] == ["bind-threads"] and len(args) >= 4:
+            code, codex_tid, agy_cid = args[1], args[2], args[3]
+            threads.save_binding(code, codex_thread_id=codex_tid, agy_conv_id=agy_cid)
+            audit.log(code, "user", "绑定对话框", "Codex(%s) <-> Gemini(%s)" % (codex_tid[:8] if codex_tid else "无", agy_cid[:8] if agy_cid else "无"))
+            print(json.dumps(state(), ensure_ascii=False))
+            return 0
+        if args[:1] == ["copy-thread-prompt"] and len(args) >= 4:
+            code, src_tool, src_tid = args[1], args[2], args[3]
+            tname = args[4] if len(args) >= 5 else "Gemini (Antigravity)"
+            cfg = common.load_config()
+            proj = common.project(cfg, code)
+            extra_task = domestic.read_state_md(proj["path"])
+            prompt = threads.build_thread_relay_prompt(code, proj["path"], src_tool, src_tid, tname, extra_task=extra_task)
+            ok = domestic.copy_to_clipboard(prompt)
+            print(json.dumps({"ok": ok, "prompt": prompt}, ensure_ascii=False))
+            return 0
+        if args[:1] == ["set-holder"] and len(args) >= 3:
+            print(json.dumps(set_base_holder(args[1], args[2]), ensure_ascii=False))
             return 0
         if args[:1] == ["save-settings"] and len(args) >= 2:
             print(json.dumps(save_settings(args[1]), ensure_ascii=False))

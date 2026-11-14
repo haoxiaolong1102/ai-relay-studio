@@ -6,9 +6,21 @@ import re
 import subprocess
 import time
 
-from . import agy, audit, baton, codex, common, domestic, gitiso, guard, lock, manifest, media, snapshot, ui
+from . import agy, audit, baton, codex, common, domestic, gitiso, guard, lock, manifest, media, snapshot, threads, ui
 from .common import HOLDER_ANTIGRAVITY, HOLDER_CLAUDE, HOLDER_CODEX, HOLDER_DEEPSEEK, HOLDER_DOUBAO, HOLDER_NAMES, RelayError
 from .redact import one_line, wrap_untrusted
+
+
+def home_holder(code):
+    """查询该工程的主力持棒者（默认 claude，若用户设了 codex 为主力则为 codex）。"""
+    try:
+        lk = lock.read_lock(code)
+        h = lk.get("home_holder")
+        if h in (HOLDER_CLAUDE, HOLDER_CODEX):
+            return h
+    except Exception:
+        pass
+    return HOLDER_CLAUDE
 
 
 def stop_flag(code):
@@ -74,7 +86,7 @@ def handback_status(path):
     return m.group(1) if m else None
 
 
-def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
+def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX, source_thread=None, target_thread=None):
     """无人值守接力：交给 Codex（默认）、Antigravity、豆包工作台或 DeepSeek，让它自己分段接着做。"""
     if to not in (HOLDER_CODEX, HOLDER_ANTIGRAVITY, HOLDER_DOUBAO, HOLDER_DEEPSEEK):
         raise RelayError("不认识这个工具：%s" % to)
@@ -90,9 +102,12 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
     if not busy.acquire({"what": "handoff"}):
         raise RelayError("“%s”的接力正在进行中，不能再开一次。" % name)
     try:
-        cur_holder = lock.holder(code)
-        if cur_holder != HOLDER_CLAUDE:
-            raise RelayError("“%s”现在已经在 %s 手里了，不能重复交出。要收回请点“交回 Claude”。" % (name, cur_holder))
+        lk = lock.read_lock(code)
+        cur_holder = lk["holder"]
+        base_home = lk.get("home_holder") or HOLDER_CLAUDE
+        base_name = HOLDER_NAMES.get(base_home, base_home)
+        if cur_holder != base_home or cur_holder == to:
+            raise RelayError("“%s”现在已经在 %s 手里了，不能重复交出。要收回请点“交回 %s”。" % (name, cur_holder, base_name))
         if from_chat:
             if ui.ask("要把“%s”交给 %s 接着做吗？" % (name, tname), ["取消", "交给 %s" % tname], "交给 %s" % tname) != "交给 %s" % tname:
                 audit.log(code, by, "交出取消", "确认框里点了取消")
@@ -105,6 +120,13 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
         baton.archive_handback(path)
         cur = manifest.take(path)
         baton.write_fragment(path, "handoff-changes.md", _baseline_changes(code, path, cur))
+        if source_thread:
+            threads.save_binding(code, codex_thread_id=source_thread if cur_holder == HOLDER_CODEX else None,
+                                 agy_conv_id=target_thread)
+            extra_task = domestic.read_state_md(path)
+            t_prompt = threads.build_thread_relay_prompt(code, path, cur_holder, source_thread, tname, extra_task=extra_task)
+            baton.write_fragment(path, "thread-context.md", t_prompt)
+            domestic.copy_to_clipboard(t_prompt)
         baton.rewrite(code, path)
         print("② 素材设只读、拍快照…", flush=True)
         snapshot.protect(cfg, code)
@@ -137,21 +159,24 @@ def handoff(cfg, code, by="user", from_chat=False, to=HOLDER_CODEX):
                 print("注意：这次 Codex 是“整台电脑全权”（没有沙箱），能改工程文件夹以外的东西。", flush=True)
                 audit.log(code, "relay", "权限", "本次接力 Codex 为整机全权（danger-full-access）")
         print("④ 把棒交给 %s…" % tname, flush=True)
-        lock.transfer(cfg, code, to, HOLDER_CLAUDE, by, extra={
+        lock.transfer(cfg, code, to, cur_holder, by, extra={
+            "home_holder": base_home,
+            "source_thread": source_thread,
+            "target_thread": target_thread,
             "snapshot": snap["id"],
             "iso_pre": gitiso.capture_pre(cfg, code, path, proj.get("raw_dirs", ())) if is_git else None,
             "guard_fp": {"protected": manifest.fingerprint_protected(pre),
                          "git_config": guard.git_config_fp(path)}})
         baton.rewrite(code, path)
-        result = _segments(cfg, code, proj, path, is_git, pre, busy, to)
+        result = _segments(cfg, code, proj, path, is_git, pre, busy, to, target_thread=target_thread)
     finally:
         busy.release()
-    msg = "“%s”这次接力先到这里：%s\n\n棒还在 %s 手里。要让 Claude 接着做，请点“收工 / 交回 Claude”。" % (name, result["outcome"], tname)
+    msg = "“%s”这次接力先到这里：%s\n\n棒还在 %s 手里。要让 %s 接着做，请点“收工 / 交回 %s”。" % (name, result["outcome"], tname, base_name, base_name)
     ui.info(msg)
     return dict(result, started=True, message=msg)
 
 
-def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX):
+def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX, target_thread=None):
     tname = HOLDER_NAMES[to]
     c = dict(cfg["codex"])
     if to == HOLDER_ANTIGRAVITY:          # 没单独写的时限、段数沿用 Codex 的
@@ -181,10 +206,15 @@ def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX):
                 cfg, to, code, path, seg, domestic.load_prompt(cfg, seg, max_seg), is_git,
                 rem_timeout, stop_flag(code),
                 on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}))
+        elif to == HOLDER_ANTIGRAVITY:
+            res = agy.run_segment(
+                cfg, code, path, seg, agy.load_prompt(cfg, seg, max_seg), is_git,
+                rem_timeout, stop_flag(code),
+                on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}),
+                conversation_id=target_thread)
         else:
-            runner = agy if to == HOLDER_ANTIGRAVITY else codex
-            res = runner.run_segment(
-                cfg, code, path, seg, runner.load_prompt(cfg, seg, max_seg), is_git,
+            res = codex.run_segment(
+                cfg, code, path, seg, codex.load_prompt(cfg, seg, max_seg), is_git,
                 rem_timeout, stop_flag(code),
                 on_start=lambda pid: busy.write({"what": "handoff", "segment": seg, "child": pid}))
         post = manifest.take(path)
@@ -245,10 +275,10 @@ def _segments(cfg, code, proj, path, is_git, pre, busy, to=HOLDER_CODEX):
     return summary
 
 
-def open_session(cfg, code, tool, by="user"):
+def open_session(cfg, code, tool, by="user", source_thread=None, target_thread=None):
     """轻量“开工”：用户要亲自到另一个工具（如 Antigravity）里做这个工程。
-    只做：整理接力棒、素材设只读、拍快照、存清单、把棒交给那个工具（Claude 这边随即只读）。不启动任何模型。"""
-    if tool not in HOLDER_NAMES or tool == HOLDER_CLAUDE:
+    只做：整理接力棒、素材设只读、拍快照、存清单、把棒交给那个工具（原主力工具随即只读）。不启动任何模型。"""
+    if tool not in HOLDER_NAMES:
         raise RelayError("不认识这个工具：%s" % tool)
     tname = HOLDER_NAMES[tool]
     proj = common.project(cfg, code)
@@ -262,10 +292,15 @@ def open_session(cfg, code, tool, by="user"):
     if not busy.acquire({"what": "open"}):
         raise RelayError("“%s”的接力正在进行中，不能再开一次。" % name)
     try:
-        cur_holder = lock.holder(code)
-        if cur_holder != HOLDER_CLAUDE:
-            raise RelayError("“%s”现在已经在 %s 手里了。要先收工/交回 Claude，才能再开工。" % (
-                name, HOLDER_NAMES.get(cur_holder, cur_holder)))
+        lk = lock.read_lock(code)
+        cur_holder = lk["holder"]
+        base_home = lk.get("home_holder") or HOLDER_CLAUDE
+        base_name = HOLDER_NAMES.get(base_home, base_home)
+        if tool == base_home:
+            raise RelayError("“%s”的主力本身就是 %s，无需向它开工。" % (name, base_name))
+        if cur_holder != base_home:
+            raise RelayError("“%s”现在已经在 %s 手里了。要先收工/交回 %s，才能再开工。" % (
+                name, HOLDER_NAMES.get(cur_holder, cur_holder), base_name))
         is_git = bool(manifest.git_dir(path))
         if is_git and not _git_ignored(path, "docs/relay/BATON.md"):
             raise RelayError("这个工程的 .gitignore 里没有 docs/relay/，为避免接力记录被提交，先不开始。")
@@ -281,35 +316,51 @@ def open_session(cfg, code, tool, by="user"):
         pre = manifest.take(path)
         manifest.save(code, "handoff-pre", pre)
         print("③ 登记：现在由 %s 来做…" % tname, flush=True)
-        lock.transfer(cfg, code, tool, HOLDER_CLAUDE, by, extra={
-            "mode": "manual", "snapshot": snap["id"],
+        lock.transfer(cfg, code, tool, cur_holder, by, extra={
+            "mode": "manual",
+            "home_holder": base_home,
+            "source_thread": source_thread,
+            "target_thread": target_thread,
+            "snapshot": snap["id"],
             "iso_pre": gitiso.capture_pre(cfg, code, path, proj.get("raw_dirs", ())) if is_git else None,
             "guard_fp": {"protected": manifest.fingerprint_protected(pre),
                          "git_config": guard.git_config_fp(path)}})
         baton.rewrite(code, path)
-        clip_prompt = domestic.build_clipboard_prompt(code, path, tname)
+        binding = threads.get_binding(code)
+        eff_src = source_thread or (binding.get("codex_thread_id") if cur_holder == HOLDER_CODEX else None)
+        eff_tgt = target_thread or binding.get("agy_conv_id")
+        if eff_src:
+            threads.save_binding(code, codex_thread_id=eff_src if cur_holder == HOLDER_CODEX else None, agy_conv_id=eff_tgt)
+            extra_task = domestic.read_state_md(path)
+            clip_prompt = threads.build_thread_relay_prompt(code, path, cur_holder, eff_src, tname, extra_task=extra_task)
+        else:
+            clip_prompt = domestic.build_clipboard_prompt(code, path, tname)
         copied = domestic.copy_to_clipboard(clip_prompt)
         launched = ""
         if tool in (HOLDER_DOUBAO, HOLDER_DEEPSEEK) and not os.environ.get("RELAY_UI_ANSWERS"):
             launched = domestic.open_tool_workspace(cfg, tool, path)
     finally:
         busy.release()
-    extra_tip = "\n✅ 已自动将【工程上下文 + 下一步任务】复制到系统剪贴板，过去直接 Cmd+V 粘贴即可！" if copied else ""
+    extra_tip = "\n✅ 已自动将【指定对话框上下文 + 下一步任务】复制到系统剪贴板，过去直接 Cmd+V 粘贴即可！" if (copied and eff_src) else (
+        "\n✅ 已自动将【工程上下文 + 下一步任务】复制到系统剪贴板，过去直接 Cmd+V 粘贴即可！" if copied else "")
     if launched:
         extra_tip += "\n🚀 " + launched
     msg = ("“%s”已开工，开工前的样子已拍了快照（%s）。%s\n\n现在可以去 %s 里打开这个文件夹干活：\n%s\n\n"
-           "这期间 Claude 在这个工程里只能看、不能改。做完后回到 AI 接力台点“收工 / 交回 Claude”。" % (
-               name, snap["id"], extra_tip, tname, path))
+           "这期间 %s 在这个工程里只能看、不能改。做完后回到合流 AI 接力台点“收工 / 交回 %s”。" % (
+               name, snap["id"], extra_tip, tname, path, base_name, base_name))
     ui.info(msg)
     return {"started": True, "message": msg, "snapshot": snap["id"], "copied": copied}
 
 
-def takeback(cfg, code, by="user"):
+def takeback(cfg, code, by="user", to=None):
     proj = common.project(cfg, code)
     path = common.real(proj["path"])
     name = proj.get("name") or code
-    if lock.holder(code) == HOLDER_CLAUDE:
-        raise RelayError("“%s”本来就在 Claude 手里，不用交回。" % name)
+    lk0 = lock.read_lock(code)
+    return_to = to or lk0.get("home_holder") or HOLDER_CLAUDE
+    return_name = HOLDER_NAMES.get(return_to, return_to)
+    if lk0["holder"] == return_to:
+        raise RelayError("“%s”本来就在 %s 手里，不用交回。" % (name, return_name))
     running = lock.Busy.peek(code)
     if running is not None:
         choice = ui.ask("接手的工具还在跑（第 %s 段）。怎么办？" % running.get("segment", "?"),
@@ -322,11 +373,12 @@ def takeback(cfg, code, by="user"):
         deadline = time.time() + float(cfg["codex"].get("segment_timeout_min", 20)) * 60 + 120
         while lock.Busy.peek(code) is not None:
             if time.time() > deadline:
-                raise RelayError("等了很久 Codex 还没停下。请稍后再双击一次“交回 Claude”。")
+                raise RelayError("等了很久 Codex 还没停下。请稍后再双击一次“交回 %s”。" % return_name)
             time.sleep(1)
     busy = lock.Busy(code)
     if not busy.acquire({"what": "takeback"}):
         raise RelayError("“%s”的接力正在进行中，稍后再试。" % name)
+    copied_back = False
     try:
         lk = lock.read_lock(code)
         tool = lk["holder"]
@@ -378,13 +430,23 @@ def takeback(cfg, code, by="user"):
             iso = gitiso.publish(cfg, code, path, tool, lk.get("since"), lk.get("snapshot"), raw_dirs, lk.get("iso_pre"))
             lines += gitiso.describe(iso)
         baton.write_fragment(path, "period.md", "\n".join(lines))
-        lock.transfer(cfg, code, HOLDER_CLAUDE, lk["holder"], by)
+        # 如果绑定了 Gemini 对话框，交回 Codex 时自动把 Gemini 对话的最新进展复制到剪贴板！
+        binding = threads.get_binding(code)
+        agy_cid = lk.get("target_thread") or binding.get("agy_conv_id")
+        if tool == HOLDER_ANTIGRAVITY and agy_cid:
+            back_prompt = threads.build_thread_relay_prompt(
+                code, path, HOLDER_ANTIGRAVITY, agy_cid, return_name,
+                extra_task="接力期间文件变更：\n" + (manifest.summarize(total) if total else "无"))
+            copied_back = domestic.copy_to_clipboard(back_prompt)
+        lock.transfer(cfg, code, return_to, lk["holder"], by, extra={"home_holder": return_to})
         manifest.save(code, "stop-latest", manifest.take(path, light=True))
         baton.rewrite(code, path)
         _clear_stop(code)
     finally:
         busy.release()
-    msg = "“%s”已交回 Claude。\n\n现在回到 Claude，在这个工程的对话里说：接回来" % name
+    msg = "“%s”已交回 %s。\n\n现在回到 %s，在这个工程的对话里说：接回来" % (name, return_name, return_name)
+    if copied_back:
+        msg += "\n✅ 同时已将刚才在 Gemini 对话框里的最新进展自动复制到剪贴板，回到原对话直接 Cmd+V 即可无缝续上！"
     if iso and iso.get("branch"):
         msg += "\n\n%s 这段时间的改动另存了一个隔离分支：%s（%s）。当前分支没动。" % (
             tname, iso["branch"], "已推到 GitHub/远程" if iso.get("pushed") else "只在本机，没推送")

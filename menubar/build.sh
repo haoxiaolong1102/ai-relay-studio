@@ -16,17 +16,24 @@ mkdir -p "$APP.new/Contents/MacOS" "$APP.new/Contents/Resources"
 if [ -f "$HERE/donate_qr.png" ]; then
   cp "$HERE/donate_qr.png" "$APP.new/Contents/Resources/donate_qr.png"
 fi
+if [ -f "$HERE/heliu_logo.png" ]; then
+  cp "$HERE/heliu_logo.png" "$APP.new/Contents/Resources/heliu_logo.png"
+fi
+if [ -f "$HERE/AppIcon.icns" ]; then
+  cp "$HERE/AppIcon.icns" "$APP.new/Contents/Resources/AppIcon.icns"
+fi
 cat > "$APP.new/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleIdentifier</key><string>local.ai-relay.studio</string>
-  <key>CFBundleName</key><string>AI 接力台</string>
-  <key>CFBundleDisplayName</key><string>AI 接力台</string>
+  <key>CFBundleIdentifier</key><string>com.heliuai.relay-studio</string>
+  <key>CFBundleName</key><string>合流 AI 接力台</string>
+  <key>CFBundleDisplayName</key><string>合流 AI 接力台</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleExecutable</key><string>RelayMenu</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
