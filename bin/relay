@@ -240,7 +240,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("status"); p.add_argument("project", nargs="?"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("handoff"); p.add_argument("--project"); p.add_argument("--from-chat", action="store_true"); p.add_argument("--to", default="codex", choices=["codex", "antigravity", "doubao", "deepseek"]); p.add_argument("--source-thread"); p.add_argument("--target-thread"); p.set_defaults(fn=cmd_handoff)
-    p = sub.add_parser("takeback"); p.add_argument("--project"); p.add_argument("--to", choices=["claude", "codex"]); p.set_defaults(fn=cmd_takeback)
+    p = sub.add_parser("takeback"); p.add_argument("--project"); p.add_argument("--to", choices=["claude", "codex", "antigravity", "doubao", "deepseek"]); p.set_defaults(fn=cmd_takeback)
     p = sub.add_parser("open"); p.add_argument("--project"); p.add_argument("--tool", default="antigravity", choices=["antigravity", "codex", "doubao", "deepseek", "claude"]); p.add_argument("--source-thread"); p.add_argument("--target-thread"); p.set_defaults(fn=cmd_open)
     p = sub.add_parser("switch"); p.set_defaults(fn=cmd_switch)
     p = sub.add_parser("repair"); p.set_defaults(fn=cmd_repair)

@@ -219,6 +219,10 @@ final class RelayStore: ObservableObject {
                 }
                 if !cur.boundAgyConvId.isEmpty {
                     self.selectedAgyConvId = cur.boundAgyConvId
+                } else if self.selectedAgyConvId.isEmpty || !self.agyConversations.contains(where: { $0.id == self.selectedAgyConvId }) {
+                    // 默认自动选中最近在做项目的 Gemini 对话（跳过当前接力台自身的对话 7d205da3）
+                    let nonSelf = self.agyConversations.first(where: { !$0.id.hasPrefix("7d205da3") })
+                    self.selectedAgyConvId = nonSelf?.id ?? (self.agyConversations.first?.id ?? "")
                 }
             }
         }
@@ -260,20 +264,26 @@ final class RelayStore: ObservableObject {
         }
     }
 
-    func copyThreadPrompt(targetToolName: String = "Gemini (Antigravity)") {
+    func copyThreadPrompt(sourceTool: String = "codex", targetToolName: String = "Gemini (Antigravity)") {
         guard let proj = selectedProject else { return }
         if stateDirty { saveStateMd() }
-        let srcTid = selectedCodexThreadId
+        let srcTid = (sourceTool == "antigravity") ? selectedAgyConvId : selectedCodexThreadId
         if srcTid.isEmpty {
             copyPrompt(toolName: targetToolName)
             return
         }
         DispatchQueue.global().async {
-            let (_, _) = runProcess([PY, HELPER, "copy-thread-prompt", proj.code, "codex", srcTid, targetToolName])
+            let (_, _) = runProcess([PY, HELPER, "copy-thread-prompt", proj.code, sourceTool, srcTid, targetToolName])
             DispatchQueue.main.async {
-                let title = proj.codexThreads.first(where: { $0.id == srcTid })?.title ?? String(srcTid.prefix(8))
-                self.bannerMessage = "📋 已仅提取【\(title)】单个对话框的上下文并复制到剪贴板！过去直接 Cmd+V 即可！"
-                self.appendLog("已精准提取 Codex 对话框「\(title)」(\(srcTid.prefix(8))) 的专属上下文到剪贴板。")
+                if sourceTool == "antigravity" {
+                    let title = self.agyConversations.first(where: { $0.id == srcTid })?.title ?? String(srcTid.prefix(8))
+                    self.bannerMessage = "📋 已提取 Gemini (Antigravity) 对话【\(title)】的完整进展到剪贴板！现在直接去 Codex (星爵工作台) 按 Cmd+V 粘贴即可！"
+                    self.appendLog("已提取 Antigravity 对话「\(title)」(\(srcTid.prefix(8))) 的进展到剪贴板，可直接粘贴回 Codex。")
+                } else {
+                    let title = proj.codexThreads.first(where: { $0.id == srcTid })?.title ?? String(srcTid.prefix(8))
+                    self.bannerMessage = "📋 已仅提取 Codex 对话【\(title)】的上下文到剪贴板！直接去 Gemini (Antigravity) 按 Cmd+V 粘贴即可！"
+                    self.appendLog("已精准提取 Codex 对话框「\(title)」(\(srcTid.prefix(8))) 的专属上下文到剪贴板。")
+                }
             }
         }
     }
@@ -853,11 +863,19 @@ struct MainWindowView: View {
                                     Text("｜ 日常主力：")
                                         .font(.system(size: 11.5))
                                         .foregroundColor(.secondary)
-                                    Button(proj.homeHolder == "codex" ? "OpenAI Codex (点击可切 Claude)" : "Claude Code (点击可切 Codex)") {
-                                        store.setBaseHolder(proj.homeHolder == "codex" ? "claude" : "codex")
+                                    Menu {
+                                        Button("设为 OpenAI Codex（我的主力）") { store.setBaseHolder("codex") }
+                                        Button("设为 Gemini (Antigravity)") { store.setBaseHolder("antigravity") }
+                                        Button("设为 豆包工作台 (Doubao)") { store.setBaseHolder("doubao") }
+                                        Button("设为 DeepSeek") { store.setBaseHolder("deepseek") }
+                                        Divider()
+                                        Button("设为 Claude Code（如有安装）") { store.setBaseHolder("claude") }
+                                    } label: {
+                                        Text("\(holderDisplayName(proj.homeHolder)) ▾")
+                                            .font(.system(size: 11.5, weight: .semibold))
                                     }
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .buttonStyle(.link)
+                                    .menuStyle(.borderlessButton)
+                                    .fixedSize()
                                 }
                             }
 
@@ -882,21 +900,22 @@ struct MainWindowView: View {
                                 .disabled(store.isBusy)
                             } else {
                                 Button(action: {
-                                    store.copyThreadPrompt(targetToolName: "Gemini (Antigravity)")
+                                    store.copyThreadPrompt(sourceTool: "antigravity", targetToolName: "OpenAI Codex")
                                 }) {
-                                    Label("仅复制选中对话框上下文", systemImage: "doc.on.doc")
-                                        .font(.system(size: 12))
+                                    Label("从 Gemini 导回 Codex", systemImage: "arrow.uturn.backward.square")
+                                        .font(.system(size: 12, weight: .semibold))
                                 }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(.borderedProminent)
+                                .tint(holderColor("codex"))
                             }
                         }
                         .padding(14)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.controlBackgroundColor)))
 
-                        // 💬 对话框级精准对接（解决一个工程文件夹下跑多个项目的问题）
+                        // 💬 对话框级双向精准对接（Codex ⇄ Gemini Antigravity）
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
-                                Label("💬 对话框精准对接（同一个目录跑多个子项目时，只转交选中的那一个对话）", systemImage: "bubble.left.and.bubble.right.fill")
+                                Label("💬 对话框双向精准对接（在 OpenAI Codex 与 Gemini Antigravity 的具体对话之间自由互导）", systemImage: "bubble.left.and.bubble.right.fill")
                                     .font(.system(size: 13.5, weight: .bold))
                                     .foregroundColor(Color(red: 0.16, green: 0.64, blue: 0.50))
                                 Spacer()
@@ -908,7 +927,7 @@ struct MainWindowView: View {
 
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("① 选择要接力的 OpenAI Codex 对话框（含历史提问与进度）：")
+                                    Text("① OpenAI Codex 对话框（如：星爵/萌样剪辑工作台）：")
                                         .font(.system(size: 11.5, weight: .semibold))
                                         .foregroundColor(.secondary)
                                     Picker("", selection: Binding(
@@ -926,13 +945,13 @@ struct MainWindowView: View {
                                     .labelsHidden()
                                 }
 
-                                Image(systemName: "arrow.right.circle.fill")
+                                Image(systemName: "arrow.left.arrow.right.circle.fill")
                                     .font(.system(size: 18))
                                     .foregroundColor(.secondary)
                                     .padding(.top, 16)
 
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("② 对接的 Google Gemini (Antigravity) 目标对话框：")
+                                    Text("② Google Gemini (Antigravity) 对话框（如：逆向与修复萌样工作台）：")
                                         .font(.system(size: 11.5, weight: .semibold))
                                         .foregroundColor(.secondary)
                                     Picker("", selection: Binding(
@@ -953,16 +972,22 @@ struct MainWindowView: View {
 
                             HStack(spacing: 10) {
                                 Button(action: {
-                                    store.copyThreadPrompt(targetToolName: "Gemini (Antigravity)")
+                                    store.copyThreadPrompt(sourceTool: "codex", targetToolName: "Gemini (Antigravity)")
                                 }) {
-                                    Label("📋 一键提取并复制该 Codex 对话专属上下文", systemImage: "doc.on.clipboard.fill")
+                                    Label("📋 正向：提取左边 Codex 对话 ➔ 复制给 Gemini", systemImage: "arrow.right.doc.on.clipboard")
                                         .font(.system(size: 12, weight: .medium))
                                 }
                                 .buttonStyle(.bordered)
 
-                                Text("提示：选好上方 Codex 对话后，点下方任意工具卡片即可只将该对话的上下文、涉及文件与进度精准移交过去！")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.secondary)
+                                Button(action: {
+                                    store.copyThreadPrompt(sourceTool: "antigravity", targetToolName: "OpenAI Codex")
+                                }) {
+                                    Label("🔙 反向：提取右边 Gemini 对话进展 ➔ 导回给 Codex (星爵/萌样工作台)", systemImage: "arrow.left.doc.on.clipboard")
+                                        .font(.system(size: 12, weight: .bold))
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(Color(red: 0.16, green: 0.64, blue: 0.50))
+
                                 Spacer()
                             }
                         }
@@ -1072,50 +1097,23 @@ struct MainWindowView: View {
                                     }
                                 )
 
-                                // 4. OpenAI Codex / Claude Code 互转卡片
-                                if proj.homeHolder == "codex" {
-                                    ToolCardView(
-                                        title: "Claude Code",
-                                        subtitle: "当前工程主力为 OpenAI Codex。如果你想把当前 Codex 对话框临时交给 Claude Code 接着改，点这里一键移交。",
-                                        badge: "主力为 Codex · 可转交 Claude",
-                                        color: holderColor("claude"),
-                                        isCurrentHolder: proj.holder == "claude",
-                                        canHandOff: canGive,
-                                        primaryLabel: "带此对话去 Claude Code 开工",
-                                        primaryAction: {
-                                            store.runRelayCommand(
-                                                title: "交给 Claude Code (\(proj.name))",
-                                                args: ["open", "--project", proj.code, "--tool", "claude"] + srcArgs,
-                                                triggerDonateAfter: true
-                                            )
-                                        },
-                                        secondaryLabel: "设 Claude 为主力",
-                                        secondaryAction: {
-                                            store.setBaseHolder("claude")
-                                        }
-                                    )
-                                } else {
-                                    ToolCardView(
-                                        title: "OpenAI Codex",
-                                        subtitle: "支持调用本机 Codex CLI 无人值守分段执行并跑单元测试，也可以点右侧直接把 Codex 设为你的日常主力。",
-                                        badge: store.settings.codexModel,
-                                        color: holderColor("codex"),
-                                        isCurrentHolder: proj.holder == "codex",
-                                        canHandOff: canGive,
-                                        primaryLabel: "让 Codex 后台自动接着做",
-                                        primaryAction: {
-                                            store.runRelayCommand(
-                                                title: "交给 Codex 自动执行 (\(proj.name))",
-                                                args: ["handoff", "--project", proj.code, "--to", "codex"] + srcArgs,
-                                                triggerDonateAfter: true
-                                            )
-                                        },
-                                        secondaryLabel: "设 Codex 为主力",
-                                        secondaryAction: {
-                                            store.setBaseHolder("codex")
-                                        }
-                                    )
-                                }
+                                // 4. OpenAI Codex（反向导回 & CLI 自动跑）
+                                ToolCardView(
+                                    title: "OpenAI Codex（主力互导）",
+                                    subtitle: "把你在 Gemini (Antigravity) 里做了一半的对话进展，一键打包导回给 OpenAI Codex（如星爵/萌样工作台）继续往下做！",
+                                    badge: "支持从 Gemini 导回 · " + store.settings.codexModel,
+                                    color: holderColor("codex"),
+                                    isCurrentHolder: proj.holder == "codex",
+                                    canHandOff: !store.isBusy,
+                                    primaryLabel: "🔙 从 Gemini 导回给 Codex",
+                                    primaryAction: {
+                                        store.copyThreadPrompt(sourceTool: "antigravity", targetToolName: "OpenAI Codex")
+                                    },
+                                    secondaryLabel: proj.homeHolder == "codex" ? "切 Gemini 为主力" : "设 Codex 为主力",
+                                    secondaryAction: {
+                                        store.setBaseHolder(proj.homeHolder == "codex" ? "antigravity" : "codex")
+                                    }
+                                )
                             }
                         }
 

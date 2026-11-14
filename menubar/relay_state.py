@@ -196,8 +196,8 @@ def add_project(name, path):
 def set_base_holder(code, holder_name):
     cfg = common.load_config()
     proj = common.project(cfg, code)
-    if holder_name not in ("codex", "claude"):
-        raise common.RelayError("主力持棒者只能设为 codex 或 claude")
+    if holder_name not in common.HOLDERS:
+        raise common.RelayError("不认识这个工具：%s" % holder_name)
     common.ensure_private_dir(common.STATE / "locks")
     cur = lock.read_lock(code)
     new_lk = dict(cur)

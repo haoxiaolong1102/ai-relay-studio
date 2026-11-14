@@ -212,9 +212,12 @@ def parse_agy_conversation(conv_id, max_turns=6):
                     for tc in (obj.get("tool_calls") or []):
                         if isinstance(tc, dict):
                             args_str = json.dumps(tc.get("arguments") or {}, ensure_ascii=False)
-                            for m in re.findall(r'[\w\-\./]+\.(?:py|swift|ts|tsx|js|json|md|html|css|sh)', args_str):
+                            for m in re.findall(r'[\w\-\./\u4e00-\u9fa5]+\.(?:py|swift|ts|tsx|js|mjs|cjs|json|md|html|css|sh)', args_str):
                                 if m not in touched_files and len(touched_files) < 25:
                                     touched_files.append(m)
+                    for m in re.findall(r'`?([\w\-\./\u4e00-\u9fa5]+\.(?:py|swift|ts|tsx|js|mjs|cjs|json|md|html|css|sh))`?', txt):
+                        if m not in touched_files and len(touched_files) < 25:
+                            touched_files.append(m)
     except OSError:
         pass
     return {
@@ -242,9 +245,15 @@ def list_agy_conversations(limit=25):
             dirs.append((os.path.getmtime(tf), name, tf))
     dirs.sort(reverse=True)
     for mtime, cid, _ in dirs[:limit]:
-        info = parse_agy_conversation(cid, max_turns=3)
+        info = parse_agy_conversation(cid, max_turns=4)
         u_list = info.get("user_messages") or []
-        title = one_line(u_list[0] if u_list else "", 44) or ("Gemini 会话 " + cid[:8])
+        latest_u = u_list[-1] if u_list else ""
+        first_u = u_list[0] if u_list else ""
+        title = one_line(latest_u or first_u, 42) or ("Gemini 会话 " + cid[:8])
+        if first_u and latest_u and first_u != latest_u:
+            s_first = one_line(first_u, 18)
+            s_last = one_line(latest_u, 22)
+            title = "%s ➔ %s" % (s_first, s_last)
         items.append({
             "id": cid,
             "tool": "antigravity",
